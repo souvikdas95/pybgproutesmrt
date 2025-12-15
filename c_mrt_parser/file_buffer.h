@@ -7,6 +7,8 @@
 #ifndef __CIRCULAR_BUFFER_H__
 #define __CIRCULAR_BUFFER_H__
 
+#include <stdint.h>
+
 #include "cfr_files.h"
 #include "mrt_entry.h"
 #include "bgp_macros.h"
@@ -39,9 +41,13 @@ typedef struct
     int idx;
 
     /**
-     * @brief IP address (in string mode) of the BGP peer.
+     * @brief IP address of the BGP peer (split 128-bit).
+     *
+     * IPv4: addr1==0 and addr0 holds IPv4 in the low 32 bits.
+     * IPv6: addr1/addr0 hold upper/lower 64 bits.
      */
-    char addr[64];
+    uint64_t addr1;
+    uint64_t addr0;
 
     /**
      * @brief AS number of the BGP peer.
@@ -314,7 +320,7 @@ int process_bgp_rib_entry(u_char *buffer, MRTentry* entry, int max_len);
  * output string if everything was parsed correctly
  */
 
-int process_prefix(u_char* buffer, char* string, int afi);
+int process_prefix(u_char* buffer, uint64_t* address1, uint64_t* address0, uint8_t* prefix_len, int afi);
 
 
 /**

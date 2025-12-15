@@ -3,18 +3,21 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 import requests
-import time
 import datetime
 import json
 import os
 from requests.exceptions import HTTPError, ConnectionError, Timeout
 import ctypes
-from ctypes import c_int, c_uint32, c_uint16, c_char, c_void_p, POINTER, Structure
+from ctypes import c_int, c_uint64, c_uint32, c_uint16, c_uint8, c_char, c_void_p, POINTER, Structure
+import struct, socket
 
 
 BGPDUMP_MAX_FILE_LEN	= 1024
 BGPDUMP_MAX_AS_PATH_LEN	= 2000
 MAX_NB_PREFIXES         = 2048
+MAX_ASPATH_ASNS         = 256
+MAX_ASPATH_SEGS         = 64
+MAX_COMMUNITIES         = 1024
 MAX_ATTR                = 4096
 
 BGP_TYPE_ZEBRA_BGP			= 16
@@ -54,7 +57,8 @@ class RIB_PEER_INDEX_T(Structure):
     _fields_ = [
         ("afi", c_int),
         ("idx", c_int),
-        ("addr", c_char * 64),
+        ("addr1", c_uint64),
+        ("addr0", c_uint64),
         ("asn", c_uint32)
     ]
 
@@ -78,75 +82,214 @@ class MRT_ENTRY(Structure):
         ("entryType", c_uint16),
         ("entrySubType", c_uint16),
         ("entryLength", c_uint32),
+
         ("bgpType", c_uint16),
+
         ("peer_asn", c_uint32),
         ("afi", c_uint16),
-        ("peerAddr", c_char * 64),
+
+        ("peer_address1", c_uint64),
+        ("peer_address0", c_uint64),
+
         ("time", c_uint32),
         ("time_ms", c_uint32),
+
         ("nbWithdraw", c_uint16),
         ("nbNLRI", c_uint16),
-        ("pfxNLRI", c_char * 64 * MAX_NB_PREFIXES),
-        ("pfxWithdraw", c_char * 64 * MAX_NB_PREFIXES),
-        ("nextHop", c_char * 64),
-        ("asPath", c_char * MAX_ATTR),
-        ("communities", c_char * MAX_ATTR),
-        ("origin", c_char * 16),
-        ("dumper", ctypes.POINTER(FILE_BUF_T)),
-        ("next", ctypes.c_void_p),
-        ("prev", ctypes.c_void_p)
+
+        ("withdraw_address1", c_uint64 * MAX_NB_PREFIXES),
+        ("withdraw_address0", c_uint64 * MAX_NB_PREFIXES),
+        ("withdraw_prefix_len", c_uint8 * MAX_NB_PREFIXES),
+
+        ("nlri_address1", c_uint64 * MAX_NB_PREFIXES),
+        ("nlri_address0", c_uint64 * MAX_NB_PREFIXES),
+        ("nlri_prefix_len", c_uint8 * MAX_NB_PREFIXES),
+
+        ("nextHop_address1", c_uint64),
+        ("nextHop_address0", c_uint64),
+
+        ("asPathLen", c_uint8),
+        ("asPathSegCount", c_uint8),
+        ("asPath", c_uint32 * MAX_ASPATH_ASNS),
+
+        ("asPathSegOffset", c_uint8 * MAX_ASPATH_SEGS),
+        ("asPathSegType", c_uint8 * MAX_ASPATH_SEGS),
+        ("asPathSegLen", c_uint8 * MAX_ASPATH_SEGS),
+
+        ("communities_count", c_uint16),
+        ("communities_attr_type", c_uint8 * MAX_COMMUNITIES),
+        ("communities_value_len", c_uint8 * MAX_COMMUNITIES),
+        ("communities1", c_uint64 * MAX_COMMUNITIES),
+        ("communities0", c_uint64 * MAX_COMMUNITIES),
+
+        ("origin", c_uint8),
+        ("origin_present", c_uint8),
+
+        ("dumper", POINTER(FILE_BUF_T)),
+        ("next", c_void_p),
+        ("prev", c_void_p),
     ]
 
 
 
+def _u128_to_ip(addr1: int, addr0: int) -> str:
+    """Convert (address1,address0) into a printable IP string.
+    Convention: IPv4 iff addr1 == 0, and IPv4 is stored in low 32 bits of addr0.
+    """
+    if addr1 == 0:
+        v4 = addr0 & 0xFFFFFFFF
+        return socket.inet_ntop(socket.AF_INET, struct.pack("!I", v4))
+    else:
+        b = addr1.to_bytes(8, "big") + addr0.to_bytes(8, "big")
+        return socket.inet_ntop(socket.AF_INET6, b)
 
+def _prefix_to_str(addr1: int, addr0: int, plen: int) -> str:
+    return f"{_u128_to_ip(addr1, addr0)}/{int(plen)}"
+
+def _decode_origin(code: int) -> str:
+    # standard: 0=IGP, 1=EGP, 2=INCOMPLETE
+    if code == 0:
+        return "IGP"
+    if code == 1:
+        return "EGP"
+    if code == 2:
+        return "INCOMPLETE"
+    return str(int(code))
+
+def _classic_comm_to_str(v: int) -> str:
+    # v is 32-bit packed (asn16<<16 | val16) placed in communities0, communities1=0
+    asn = (v >> 16) & 0xFFFF
+    val = v & 0xFFFF
+    return f"{asn}:{val}"
 
 class BGPmessage:
     """
-    Structre that represents a BGP message
+    Structure that represents a BGP message parsed from an MRT entry.
+
+    This class is a thin Python wrapper around a native MRTentry structure.
+    All protocol fields are stored in native, non-string form (integers and
+    integer arrays). Human-readable string representations are derived
+    on demand via helper properties.
 
     Attributes:
-        ts (float): UNIX timestamp at which the BGP message has been collected by the VP.
-        type (int): Type of MRT entry (e.g., BGP4MP, BGP4MP_ET, ..)
-        nlri (list): List of all prefixes (in string mode) that have been announced in the
-        current BGP message.
-        withdraws (list): List of all prefixes (in string mode) that have been withdrawn in
-        the current BGP message.
-        origin (str): String representation of the origin BGP attribute.
-        nexthop (str): String representation of the nethop BGP attribute.
-        as_path (str): String representation of the AS path BGP attribute.
-        communities (str): String representation of the Community values BGP attribute.
-        peer_asn (str): AS number of the VP from which we received the message.
-        peer_addr (str): String represntation of the IP address of the BGP peer from which
-        we received the message.
-        msgType (str): String representation of the type of BGP message (e.g., UPDATE, OPEN,...).
-        bgpType (int): Integer value of the type of BGP message.
+        ts (float):
+            UNIX timestamp at which the BGP message was collected by the
+            vantage point (seconds + fractional microseconds).
+
+        type (int):
+            MRT entry type (e.g., BGP4MP, BGP4MP_ET, TABLE_DUMP_V2).
+
+        bgpType (int):
+            Numeric BGP message type (e.g., UPDATE, OPEN, KEEPALIVE,
+            NOTIFICATION, STATE_CHANGE).
+
+        msgType (str):
+            Single-character message code derived from bgpType:
+            'U' (UPDATE), 'O' (OPEN), 'K' (KEEPALIVE),
+            'N' (NOTIFICATION), 'S' (STATE_CHANGE), 'R' (RIB entry).
+
+        peer_asn (int):
+            Autonomous System Number (ASN) of the BGP peer from which
+            the message was received.
+
+        peer_addr (tuple[int, int]):
+            BGP peer IP address stored as a split 128-bit integer
+            (address1, address0). IPv4 addresses are represented with
+            address1 == 0 and address0 holding the IPv4 value.
+
+        nlri (list[tuple[int, int, int]]):
+            List of announced prefixes in native form.
+            Each prefix is represented as:
+                (address1, address0, prefix_len)
+
+        withdraws (list[tuple[int, int, int]]):
+            List of withdrawn prefixes in native form.
+            Each prefix is represented as:
+                (address1, address0, prefix_len)
+
+        nexthop (tuple[int, int]):
+            Next-hop IP address stored as a split 128-bit integer
+            (address1, address0).
+
+        origin (int | None):
+            Raw ORIGIN attribute code:
+                0 = IGP
+                1 = EGP
+                2 = INCOMPLETE
+            None if the ORIGIN attribute is not present.
+
+        as_path (list[int]):
+            Flattened list of ASNs forming the AS_PATH attribute.
+
+        as_path_segments (list[tuple[int, int, int]]):
+            Metadata describing AS_PATH segments, preserving AS_SEQUENCE,
+            AS_SET, and confederation boundaries.
+            Each segment is represented as:
+                (segment_type, segment_length, offset_into_as_path)
+
+        communities (list[tuple[int, int, int, int]]):
+            List of BGP community values stored in a future-proof,
+            128-bit representation.
+            Each community is represented as:
+                (attr_type, value_len, high_64_bits, low_64_bits)
+
+    Notes:
+        - No protocol field is stored as a string internally.
+        - String representations (IP addresses, prefixes, AS paths,
+          communities) are generated lazily for debugging or display.
+        - The representation is suitable for zero-copy transfer to
+          NumPy, CuPy, or Arrow-based analytics pipelines.
     """
+
     def __init__(self, mrtentry):
-        self._ts          = 0.0
-        self._type        = 0
-        self._nlri        = list()
-        self._withdraws   = list()
-        self._origin      = ""
-        self._nexthop     = ""
-        self._as_path     = ""
-        self._communities = ""
-        self._peer_asn    = 0
-        self._peer_addr   = ""
-        self._msgType     = "Unknown"
-        self._bgpType     = 0
+        e = mrtentry.contents
 
-        self._type = mrtentry.contents.entryType
-        self._origin = mrtentry.contents.origin.decode()
-        self._as_path = mrtentry.contents.asPath.decode()
-        self._communities = mrtentry.contents.communities.decode()
-        self._nexthop = mrtentry.contents.nextHop.decode()
-        self._ts = mrtentry.contents.time + mrtentry.contents.time_ms / 1000000
-        self._peer_asn = mrtentry.contents.peer_asn
-        self._peer_addr = mrtentry.contents.peerAddr.decode()
-        self._bgpType = mrtentry.contents.bgpType
+        self._type = int(e.entryType)
+        self._bgpType = int(e.bgpType)
 
-        # Setup MSG Type
+        # timestamp (float seconds)
+        self._ts = float(e.time) + (float(e.time_ms) / 1_000_000.0)
+
+        self._peer_asn = int(e.peer_asn)
+        self._peer_addr = (int(e.peer_address1), int(e.peer_address0))
+
+        # origin
+        self._origin_present = bool(int(e.origin_present))
+        self._origin = int(e.origin) if self._origin_present else None
+
+        # next hop
+        self._nexthop = (int(e.nextHop_address1), int(e.nextHop_address0))
+
+        # prefixes: store native, optionally also keep string view helpers
+        self._withdraws = [
+            (int(e.withdraw_address1[i]), int(e.withdraw_address0[i]), int(e.withdraw_prefix_len[i]))
+            for i in range(int(e.nbWithdraw))
+        ]
+        self._nlri = [
+            (int(e.nlri_address1[i]), int(e.nlri_address0[i]), int(e.nlri_prefix_len[i]))
+            for i in range(int(e.nbNLRI))
+        ]
+
+        # AS-PATH: flattened ASNs + segment metadata
+        self._as_path = [int(e.asPath[i]) for i in range(int(e.asPathLen))]
+        self._as_path_segments = [
+            (int(e.asPathSegType[s]),
+            int(e.asPathSegLen[s]),
+            int(e.asPathSegOffset[s]))
+            for s in range(int(e.asPathSegCount))
+        ]
+
+        # Communities: future-proof 128-bit lanes + metadata
+        self._communities = [
+            (int(e.communities_attr_type[i]),
+            int(e.communities_value_len[i]),
+            int(e.communities1[i]),
+            int(e.communities0[i]))
+            for i in range(int(e.communities_count))
+        ]
+
+        # Setup msgType (same behavior as before)
+        self._msgType = "Unknown"
         if self.type == BGP_TYPE_ZEBRA_BGP or self.type == BGP_TYPE_ZEBRA_BGP_ET:
             if self._bgpType == BGP_TYPE_OPEN:
                 self._msgType = "O"
@@ -158,72 +301,123 @@ class BGPmessage:
                 self._msgType = "K"
             elif self._bgpType == BGP_TYPE_STATE_CHANGE:
                 self._msgType = "S"
-
         elif self._type == BGP_TYPE_TABLE_DUMP_V2:
             self._msgType = "R"
 
+    # --- properties (native forms) ---
 
-        for i in range(0, mrtentry.contents.nbWithdraw):
-            self._withdraws.append(mrtentry.contents.pfxWithdraw[i].value.decode())
-
-        for i in range(0, mrtentry.contents.nbNLRI):
-            self._nlri.append(mrtentry.contents.pfxNLRI[i].value.decode())
-
-
-    
     @property
     def ts(self) -> float:
         return self._ts
-    
+
     @property
     def type(self) -> int:
         return self._type
-    
+
     @property
-    def nlri(self) -> list[str]:
+    def nlri(self):
+        # list[tuple[address1,address0,prefix_len]]
         return self._nlri
-    
+
     @property
-    def withdraws(self) -> list[str]:
+    def withdraws(self):
         return self._withdraws
-    
+
     @property
-    def origin(self) -> str:
+    def origin(self):
+        # int or None
         return self._origin
-    
+
     @property
-    def nexthop(self) -> str:
+    def nexthop(self):
+        # (addr1, addr0)
         return self._nexthop
-    
+
     @property
-    def as_path(self) -> str:
+    def as_path(self):
+        # list[int]
         return self._as_path
-    
+
     @property
-    def communities(self) -> str:
+    def as_path_segments(self):
+        # list[{"type","len","off"}]
+        return self._as_path_segments
+
+    @property
+    def communities(self):
+        # list[{"attr_type","value_len","hi","lo"}]
         return self._communities
-    
+
     @property
     def peer_asn(self) -> int:
         return self._peer_asn
-    
+
     @property
-    def peer_addr(self) -> str:
+    def peer_addr(self):
+        # (addr1, addr0)
         return self._peer_addr
-    
+
     @property
     def msgType(self) -> str:
         return self._msgType
-    
+
     @property
-    def bgpType(self) -> str:
+    def bgpType(self) -> int:
         return self._bgpType
 
-    
-    def __str__(self):
-        res = "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}".format(self.msgType, self.ts, ",".join(self.nlri), ",".join(self.withdraws), self.origin, self.nexthop, self.as_path, self.communities, self.peer_asn, self.peer_addr)
+    # --- convenience string views (optional) ---
 
-        return res
+    @property
+    def origin_str(self) -> str:
+        return "" if self._origin is None else _decode_origin(self._origin)
+
+    @property
+    def peer_addr_str(self) -> str:
+        a1, a0 = self._peer_addr
+        return _u128_to_ip(a1, a0)
+
+    @property
+    def nexthop_str(self) -> str:
+        a1, a0 = self._nexthop
+        return _u128_to_ip(a1, a0)
+
+    @property
+    def nlri_str(self):
+        return [_prefix_to_str(a1, a0, plen) for (a1, a0, plen) in self._nlri]
+
+    @property
+    def withdraws_str(self):
+        return [_prefix_to_str(a1, a0, plen) for (a1, a0, plen) in self._withdraws]
+
+    @property
+    def as_path_str(self) -> str:
+        return " ".join(str(x) for x in self._as_path)
+
+    @property
+    def communities_str(self) -> str:
+        parts = []
+        for (attr_type, value_len, hi, lo) in self._communities:
+            if attr_type == 8 and value_len == 4 and hi == 0:
+                parts.append(_classic_comm_to_str(lo & 0xFFFFFFFF))
+            else:
+                parts.append(f"{attr_type}:{value_len}:{hi:016x}{lo:016x}")
+        return " ".join(parts)
+
+    def __str__(self):
+        # Keep the old pipe format for readability/debug,
+        # but computed from native fields.
+        return "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}".format(
+            self.msgType,
+            self.ts,
+            ",".join(self.nlri_str),
+            ",".join(self.withdraws_str),
+            self.origin_str,
+            self.nexthop_str,
+            self.as_path_str,
+            self.communities_str,
+            self.peer_asn,
+            self.peer_addr_str,
+        )
     
 
 

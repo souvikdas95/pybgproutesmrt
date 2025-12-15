@@ -5,6 +5,43 @@
  */
 
 #include "file_buffer.h"
+#include <string.h>
+#include <stdint.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
+/* ========= Binary address helpers ========= */
+static inline uint64_t pack_u64_be(const uint8_t* p)
+{
+    return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) | ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+           ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) | ((uint64_t)p[6] << 8)  | ((uint64_t)p[7]);
+}
+
+static inline void pack_ipv4_from_bytes(const uint8_t* p, uint64_t* a1, uint64_t* a0)
+{
+    uint32_t v4 = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | ((uint32_t)p[3]);
+    *a1 = 0;
+    *a0 = (uint64_t)v4;
+}
+
+static inline void pack_ipv6_from_bytes(const uint8_t* p, uint64_t* a1, uint64_t* a0)
+{
+    *a1 = pack_u64_be(p);
+    *a0 = pack_u64_be(p + 8);
+}
+
+static inline void pack_128_from_bytes_be(const uint8_t* p, uint8_t n, uint64_t* hi, uint64_t* lo)
+{
+    /* Pack up to 16 bytes into (hi, lo). Bytes beyond n are treated as 0.
+     * Bytes are interpreted as big-endian at their position.
+     */
+    uint8_t tmp[16];
+    memset(tmp, 0, 16);
+    if (n > 16) n = 16;
+    if (n > 0) memcpy(tmp, p, n);
+    *hi = pack_u64_be(tmp);
+    *lo = pack_u64_be(tmp + 8);
+}
 
 
 void print_raw_bgp_message(u_char* buffer, int len, uint16_t type, uint16_t subType)
@@ -64,36 +101,38 @@ void get_buf_n(u_char* buf, char* dest, int n)
 
 
 
-int process_prefix(u_char* buffer, char* string, int afi)
+int process_prefix(u_char* buffer, uint64_t* address1, uint64_t* address0, uint8_t* prefix_len, int afi)
 {
-    /* Get te prefix length */
+    /* Prefix length is in bits */
     int pfxLen = get_buf_char(buffer);
-    
+
     if (pfxLen > 128)
     {
         return -1;
     }
 
-    int nbBytesPfx = (pfxLen+7)/8;
+    int nbBytesPfx = (pfxLen + 7) / 8;
 
-    /* Get the prefix */
-    u_char peer_ip[16];
-    u_char tmp_str[52];
+    if (prefix_len) *prefix_len = (uint8_t)pfxLen;
 
-    memset(peer_ip, 0, 16);
-    get_buf_n(buffer+1, (char*)peer_ip, nbBytesPfx);
-
-    memset(tmp_str, 0, 52);
-
-    if (inet_ntop(afi, peer_ip, (char*)tmp_str, 52) == NULL) 
+    if (afi == AF_INET)
     {
-        return -1;
+        uint8_t tmp4[4];
+        memset(tmp4, 0, 4);
+        get_buf_n(buffer + 1, (char*)tmp4, nbBytesPfx > 4 ? 4 : nbBytesPfx);
+        pack_ipv4_from_bytes(tmp4, address1, address0);
+        return 1 + nbBytesPfx;
+    }
+    else if (afi == AF_INET6)
+    {
+        uint8_t tmp16[16];
+        memset(tmp16, 0, 16);
+        get_buf_n(buffer + 1, (char*)tmp16, nbBytesPfx > 16 ? 16 : nbBytesPfx);
+        pack_ipv6_from_bytes(tmp16, address1, address0);
+        return 1 + nbBytesPfx;
     }
 
-    /* Write the prefix in string format */
-    snprintf(string, 64, "%s/%d", tmp_str, pfxLen);
-
-    return 1+nbBytesPfx;
+    return -1;
 }
 
 
@@ -344,10 +383,7 @@ int process_classic_message(u_char* buffer, MRTentry* entry, int max_len)
         /* Skip destination IP */
         UPDATE_AND_CHECK_LEN(actOff, 4, max_len, 0)
 
-        if (inet_ntop(AF_INET, peer_ip, entry->peerAddr, 64) == NULL) 
-        {
-            return 0;
-        }
+        pack_ipv4_from_bytes((const uint8_t*)peer_ip, &entry->peer_address1, &entry->peer_address0);
     }
     else if (entry->afi == BGP_IPV6_AFI)
     {
@@ -357,10 +393,7 @@ int process_classic_message(u_char* buffer, MRTentry* entry, int max_len)
         /* Skip destination IP */
         UPDATE_AND_CHECK_LEN(actOff, 16, max_len, 0) 
 
-        if (inet_ntop(AF_INET6, peer_ip, entry->peerAddr, 64) == NULL) 
-        {
-            return 0;
-        }
+        pack_ipv6_from_bytes((const uint8_t*)peer_ip, &entry->peer_address1, &entry->peer_address0);
     }
     else
     {
@@ -452,7 +485,7 @@ int process_bgp_update(u_char* buffer, MRTentry* entry, int max_len)
         else
         {
             /* Get te prefix length */
-            parsedLen = process_prefix(buffer+actOff, entry->pfxWithdraw[entry->nbWithdraw], AF_INET);
+            parsedLen = process_prefix(buffer+actOff, &entry->withdraw_address1[entry->nbWithdraw], &entry->withdraw_address0[entry->nbWithdraw], &entry->withdraw_prefix_len[entry->nbWithdraw], AF_INET);
             if (parsedLen == -1)
             {
                 return 0;
@@ -495,7 +528,7 @@ int process_bgp_update(u_char* buffer, MRTentry* entry, int max_len)
         }
         else
         {
-            ret = process_prefix(buffer+actOff, entry->pfxNLRI[entry->nbNLRI], AF_INET);
+            ret = process_prefix(buffer+actOff, &entry->nlri_address1[entry->nbNLRI], &entry->nlri_address0[entry->nbNLRI], &entry->nlri_prefix_len[entry->nbNLRI], AF_INET);
             if (ret == -1)
             {
                 return 0;
@@ -573,19 +606,13 @@ int process_bgp_rib_index(u_char *buffer, MRTentry* entry, int max_len)
             if (peerType & 0x01) /* Case IPv6 peer */
             {
                 /* Get peer IP address */
-                if (inet_ntop(AF_INET6, buffer+actOff, entry->dumper->index[peerIdx].addr, 64) == NULL) 
-                {
-                    return 0;
-                }
+                pack_ipv6_from_bytes((const uint8_t*)(buffer+actOff), &entry->dumper->index[peerIdx].addr1, &entry->dumper->index[peerIdx].addr0);
                 UPDATE_AND_CHECK_LEN(actOff, 16, max_len, 0)
             }
             else /* Case IPv4 peer */
             {
                 /* Get peer IP address */
-                if (inet_ntop(AF_INET, buffer+actOff, entry->dumper->index[peerIdx].addr, 64) == NULL) 
-                {
-                    return 0;
-                }
+                pack_ipv4_from_bytes((const uint8_t*)(buffer+actOff), &entry->dumper->index[peerIdx].addr1, &entry->dumper->index[peerIdx].addr0);
                 UPDATE_AND_CHECK_LEN(actOff, 4, max_len, 0)
             }
 
@@ -647,11 +674,13 @@ int process_bgp_rib_entry(u_char *buffer, MRTentry* entry, int max_len)
     /* Process prefix */
     if (entry->entrySubType == BGP_SUBTYPE_RIB_IPV4_UNICAST)
     {
-        ret = process_prefix(buffer+actOff, entry->pfxNLRI[entry->nbNLRI++], AF_INET);
+        ret = process_prefix(buffer+actOff, &entry->nlri_address1[entry->nbNLRI], &entry->nlri_address0[entry->nbNLRI], &entry->nlri_prefix_len[entry->nbNLRI], AF_INET);
+        if (ret != -1) entry->nbNLRI++;
     }
     else
     {
-        ret = process_prefix(buffer+actOff, entry->pfxNLRI[entry->nbNLRI++], AF_INET6);
+        ret = process_prefix(buffer+actOff, &entry->nlri_address1[entry->nbNLRI], &entry->nlri_address0[entry->nbNLRI], &entry->nlri_prefix_len[entry->nbNLRI], AF_INET6);
+        if (ret != -1) entry->nbNLRI++;
     }
 
     if (ret == -1)
@@ -676,8 +705,9 @@ int process_bgp_rib_entry(u_char *buffer, MRTentry* entry, int max_len)
     }
 
     /* Setup the peer infos according to index */
-    entry->peer_asn = entry->dumper->index[peerIdx].asn;
-    memcpy(entry->peerAddr, entry->dumper->index[peerIdx].addr, 32);
+    entry->peer_asn      = entry->dumper->index[peerIdx].asn;
+    entry->peer_address1  = entry->dumper->index[peerIdx].addr1;
+    entry->peer_address0  = entry->dumper->index[peerIdx].addr0;
 
     /* Skip timestamp (already in MRT header) */
     UPDATE_AND_CHECK_LEN(actOff, 4, max_len, 0)
@@ -716,8 +746,9 @@ int process_bgp_rib_entry(u_char *buffer, MRTentry* entry, int max_len)
         }
 
         /* Setup the peer infos according to index */
-        tmpEntry->peer_asn = entry->dumper->index[peerIdx].asn;
-        memcpy(tmpEntry->peerAddr, entry->dumper->index[peerIdx].addr, 32);
+        tmpEntry->peer_asn      = entry->dumper->index[peerIdx].asn;
+        tmpEntry->peer_address1  = entry->dumper->index[peerIdx].addr1;
+        tmpEntry->peer_address0  = entry->dumper->index[peerIdx].addr0;
 
         /* Skip timestamp */
         UPDATE_AND_CHECK_LEN(actOff, 4, max_len, 0)
@@ -749,10 +780,6 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
     uint16_t actAllAttrLen = 0;
     uint8_t attrFlags, attrType;
     uint16_t attrLen;
-    uint32_t asn, com;
-    uint32_t aspActStrLen = 0;
-    uint32_t comActStrlen = 0;
-    int ret;
     int parsedLen;
     uint8_t val;
     uint8_t segType;
@@ -799,214 +826,190 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
         switch (attrType)
         {
             case BGP_UPDATE_ATTR_ORIGIN:
+            {
                 /* Get origin value */
                 val = get_buf_char(buffer+actOff);
+                entry->origin = (uint8_t)val;
+                entry->origin_present = 1;
                 UPDATE_AND_CHECK_LEN(actOff, attrLen, allAttrLen, 0)
-
-                if (val == BGP_UPDATE_ORIGIN_IGP)
-                {
-                    snprintf(entry->origin, 16, "IGP");
-                }
-                else if (val == BGP_UPDATE_ORIGIN_EGP)
-                {
-                    snprintf(entry->origin, 16, "EGP");
-                }
-                else if (val == BGP_UPDATE_ORIGIN_INCOMPLETE)
-                {
-                    snprintf(entry->origin, 16, "INCOMPLETE");
-                }
-                else
-                {
-                    snprintf(entry->origin, 16, "UNKNOWN");
-                }
-
                 break;
+            }
 
             /* Parsing the AS path */
             case BGP_UPDATE_ATTR_AS_PATH:
+            case BGP_UPDATE_ATTR_AS4_PATH:
+            {
                 segType   = 0;
                 segLen    = 0;
                 parsedLen = 0;
 
-                /* While we did not parse the entire AS path */
-                while (parsedLen < attrLen)
-                {   
+                /* Determine ASN width */
+                int asnBytes = 0;
+                if (attrType == BGP_UPDATE_ATTR_AS4_PATH)
+                {
+                    asnBytes = 4;
+                }
+                else
+                {
+                    if (entry->entrySubType == MRT_SUBTYPE_BGP4MP_MESSAGE ||
+                        entry->entrySubType == MRT_SUBTYPE_BGP4MP_MESSAGE_LOCAL)
+                    {
+                        asnBytes = 2;
+                    }
+                    else
+                    {
+                        asnBytes = 4;
+                    }
+                }
 
+                /* Reset any previous AS-PATH data (defensive) */
+                entry->asPathLen = 0;
+                entry->asPathSegCount = 0;
+
+                while (parsedLen < attrLen)
+                {
                     segType = get_buf_char(buffer+actOff);
                     UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0)
 
                     segLen = get_buf_char(buffer+actOff);
                     UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0)
 
-
                     parsedLen += 2;
 
-                    /* Swicth AS path segment type */
-                    switch (segType)
-                    {   
-                        /* In case of an AS sequence */
-                        case BGP_UPDATE_AS_PATH_SEQ:
-                            /* AS seq */
-                            for (int i = 0 ; i < segLen ; i++)
-                            {
-                                // Parse the ASN
-                                if (entry->entrySubType == MRT_SUBTYPE_BGP4MP_MESSAGE || entry->entrySubType == MRT_SUBTYPE_BGP4MP_MESSAGE_LOCAL)
-                                {
-                                    asn = get_buf_short(buffer+actOff);
-                                    UPDATE_AND_CHECK_LEN(actOff, 2, allAttrLen, 0)
-                                    parsedLen += 2;
-                                }
-                                else
-                                {
-                                    asn = get_buf_int(buffer+actOff);
-                                    UPDATE_AND_CHECK_LEN(actOff, 4, allAttrLen, 0)
-                                    parsedLen += 4;
-                                }
-                                
-                                
-                                /* Do not add a extra space if last element of the AS-path */
-                                if (parsedLen == attrLen)
-                                {
-                                    ret = snprintf(entry->asPath+aspActStrLen, MAX_ATTR - aspActStrLen, "%u", asn);
-                                }
-                                else
-                                {
-                                    ret = snprintf(entry->asPath+aspActStrLen, MAX_ATTR - aspActStrLen, "%u ", asn);
-                                }
-                                
-                                if (ret < 0)
-                                {
-                                    return 0;
-                                }
+                    /* Record segment metadata if possible */
+                    if (entry->asPathSegCount < MAX_ASPATH_SEGS)
+                    {
+                        entry->asPathSegType[entry->asPathSegCount] = (uint8_t)segType;
+                        entry->asPathSegLen[entry->asPathSegCount]  = (uint8_t)segLen;
+                        entry->asPathSegOffset[entry->asPathSegCount] = entry->asPathLen;
+                        entry->asPathSegCount++;
+                    }
 
-                                aspActStrLen += ret;
-                                if (aspActStrLen >= MAX_SEND_BUFF)
-                                {
-                                    return 0;
-                                }
-                            }
-                            break;
+                    /* Parse ASNs in the segment */
+                    for (int i = 0; i < segLen; i++)
+                    {
+                        uint32_t asn_val = 0;
 
-                        /* Case of an AS set */
-                        case BGP_UPDATE_AS_PATH_SET:
-                            /* AS Set */
-                            ret = snprintf(entry->asPath+aspActStrLen, MAX_ATTR - aspActStrLen, "{");
-                            if (ret < 0)
-                            {
-                                return 0;
-                            }
+                        if (asnBytes == 2)
+                        {
+                            asn_val = (uint32_t)get_buf_short(buffer+actOff);
+                            UPDATE_AND_CHECK_LEN(actOff, 2, allAttrLen, 0)
+                            parsedLen += 2;
+                        }
+                        else
+                        {
+                            asn_val = (uint32_t)get_buf_int(buffer+actOff);
+                            UPDATE_AND_CHECK_LEN(actOff, 4, allAttrLen, 0)
+                            parsedLen += 4;
+                        }
 
-                            aspActStrLen += ret;
-                            if (aspActStrLen >= MAX_SEND_BUFF)
-                            {
-                                return 0;
-                            }
-
-                            for (int i = 0 ; i < segLen ; i++)
-                            {
-                                if (entry->entrySubType == MRT_SUBTYPE_BGP4MP_MESSAGE || entry->entrySubType ==MRT_SUBTYPE_BGP4MP_MESSAGE_LOCAL)
-                                {
-                                    asn = get_buf_short(buffer+actOff);
-                                    UPDATE_AND_CHECK_LEN(actOff, 2, allAttrLen, 0)
-                                    parsedLen += 2;
-                                }
-                                else
-                                {
-                                    asn = get_buf_int(buffer+actOff);
-                                    UPDATE_AND_CHECK_LEN(actOff, 4, allAttrLen, 0)
-                                    parsedLen += 4;
-                                }
-
-                                ret = snprintf(entry->asPath+aspActStrLen, MAX_SEND_BUFF-aspActStrLen, "%u", asn);
-                                if (ret < 0)
-                                {
-                                    return 0;
-                                }
-
-                                aspActStrLen += ret;
-                                if (aspActStrLen >= MAX_SEND_BUFF)
-                                {
-                                    return 0;
-                                }
-
-                                if (i < segLen-1)
-                                {
-                                    ret = snprintf(entry->asPath+aspActStrLen, MAX_SEND_BUFF-aspActStrLen, ",");
-                                    if (ret < 0)
-                                    {
-                                        return 0;
-                                    }
-
-                                    aspActStrLen += ret;
-                                    if (aspActStrLen >= MAX_SEND_BUFF)
-                                    {
-                                        return 0;
-                                    }
-                                }
-                            }
-
-                            ret = snprintf(entry->asPath+aspActStrLen, MAX_SEND_BUFF-aspActStrLen, "}");
-                            if (ret < 0)
-                            {
-                                return 0;
-                            }
-
-                            aspActStrLen += ret;
-                            if (aspActStrLen >= MAX_SEND_BUFF)
-                            {
-                                return 0;
-                            }
-
-                            break;
-
-                        default:
-                            break;
-
+                        if (entry->asPathLen < MAX_ASPATH_ASNS)
+                        {
+                            entry->asPath[entry->asPathLen++] = asn_val;
+                        }
                     }
                 }
+
                 break;
+            }
 
             /* Parse the BGP communities */
             case BGP_UPDATE_NLRI_COMMUNITIES:
+            {
                 parsedLen = 0;
-                while (parsedLen < attrLen)
-                {   
-                    /* Get the first 2 bytes */
-                    asn = get_buf_short(buffer+actOff);
+
+                while (parsedLen + 4 <= attrLen)
+                {
+                    /* Classic community: 4 bytes */
+                    uint16_t c_asn = get_buf_short(buffer+actOff);
                     UPDATE_AND_CHECK_LEN(actOff, 2, allAttrLen, 0)
-                    parsedLen += 2;
-
-                    /* Get the second part of the communities */
-                    com = get_buf_short(buffer+actOff);
+                    uint16_t c_val = get_buf_short(buffer+actOff);
                     UPDATE_AND_CHECK_LEN(actOff, 2, allAttrLen, 0)
-                    parsedLen += 2;
+                    parsedLen += 4;
 
-                    /* Do not add extra space if end of community set */
-                    if (parsedLen == attrLen)
+                    if (entry->communities_count < MAX_COMMUNITIES)
                     {
-                        ret = snprintf(entry->communities+comActStrlen, MAX_ATTR-comActStrlen, "%d:%d", asn, com);
-                    }
-                    else
-                    {
-                        ret = snprintf(entry->communities+comActStrlen, MAX_ATTR-comActStrlen, "%d:%d ", asn, com);
-                    }
-                    
-                    if (ret < 0)
-                    {
-                        return -1;
-                    }
-
-                    comActStrlen += ret;
-                    if (comActStrlen >= MAX_ATTR)
-                    {
-                        return -1;
+                        uint32_t packed = ((uint32_t)c_asn << 16) | (uint32_t)c_val;
+                        entry->communities_attr_type[entry->communities_count]  = (uint8_t)attrType; /* usually 8 */
+                        entry->communities_value_len[entry->communities_count]  = 4;
+                        entry->communities1[entry->communities_count]           = 0;
+                        entry->communities0[entry->communities_count]           = (uint64_t)packed;
+                        entry->communities_count++;
                     }
                 }
+
+                /* Skip any remaining odd bytes */
+                if (parsedLen < attrLen)
+                {
+                    UPDATE_AND_CHECK_LEN(actOff, attrLen - parsedLen, allAttrLen, 0)
+                }
+
                 break;
+            }
+
+            case BGP_UPDATE_ATTR_EXT_COMMUNITIES:
+            {
+                parsedLen = 0;
+                while (parsedLen + 8 <= attrLen)
+                {
+                    if (entry->communities_count >= MAX_COMMUNITIES)
+                    {
+                        UPDATE_AND_CHECK_LEN(actOff, attrLen - parsedLen, allAttrLen, 0)
+                        parsedLen = attrLen;
+                        break;
+                    }
+
+                    entry->communities_attr_type[entry->communities_count] = (uint8_t)attrType; /* 16 */
+                    entry->communities_value_len[entry->communities_count] = 8;
+                    entry->communities1[entry->communities_count] = 0;
+                    entry->communities0[entry->communities_count] = pack_u64_be((const uint8_t*)(buffer+actOff));
+                    entry->communities_count++;
+
+                    UPDATE_AND_CHECK_LEN(actOff, 8, allAttrLen, 0)
+                    parsedLen += 8;
+                }
+
+                if (parsedLen < attrLen)
+                {
+                    UPDATE_AND_CHECK_LEN(actOff, attrLen - parsedLen, allAttrLen, 0)
+                }
+                break;
+            }
+
+            case BGP_UPDATE_ATTR_LARGE_COMMUNITIES:
+            {
+                parsedLen = 0;
+                while (parsedLen + 12 <= attrLen)
+                {
+                    if (entry->communities_count >= MAX_COMMUNITIES)
+                    {
+                        UPDATE_AND_CHECK_LEN(actOff, attrLen - parsedLen, allAttrLen, 0)
+                        parsedLen = attrLen;
+                        break;
+                    }
+
+                    /* Pack 12 bytes into 128-bit (hi, lo) */
+                    pack_128_from_bytes_be((const uint8_t*)(buffer+actOff), 12,
+                                           &entry->communities1[entry->communities_count],
+                                           &entry->communities0[entry->communities_count]);
+                    entry->communities_attr_type[entry->communities_count] = (uint8_t)attrType; /* 32 */
+                    entry->communities_value_len[entry->communities_count] = 12;
+                    entry->communities_count++;
+
+                    UPDATE_AND_CHECK_LEN(actOff, 12, allAttrLen, 0)
+                    parsedLen += 12;
+                }
+
+                if (parsedLen < attrLen)
+                {
+                    UPDATE_AND_CHECK_LEN(actOff, attrLen - parsedLen, allAttrLen, 0)
+                }
+                break;
+            }
 
             /* Parse the nexthop attribute */
             case BGP_UPDATE_ATTR_NEXT_HOP:
-
+            {
                 /* Check that the Next-hop is 4-bytes long, return otherwise */
                 if (attrLen != 4)
                 {
@@ -1014,107 +1017,130 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
                     return 0;
                 }
 
-                if (inet_ntop(AF_INET, buffer+actOff, entry->nextHop, 64) == NULL) 
-                {
-                    return 0;
-                }
-
+                pack_ipv4_from_bytes((const uint8_t*)(buffer+actOff),
+                                     &entry->nextHop_address1, &entry->nextHop_address0);
                 UPDATE_AND_CHECK_LEN(actOff, attrLen, allAttrLen, 0)
 
                 break;
+            }
 
             /* Parse MP NRLI REACH, i.e., parse IPv6 nexthop and prefixes */
             case BGP_UPDATE_ATTR_NLRI:
+            {
                 parsedLen = 0;
 
-                /* In case we are not in a shortened MRT MP reach */
+                /* 
+                 * Handle truncated MP_REACH in some MRT encodings (no AFI/SAFI fields).
+                 * If first byte is non-zero, treat as "compressed" and skip AFI/SAFI parsing.
+                 */
+                isMRTcompressed = false;
                 if (buffer[actOff] != 0)
                 {
                     isMRTcompressed = true;
                 }
-                else
-                {
-                    isMRTcompressed = false;
-                }
-                
 
+                /* Skip AFI + SAFI if present */
                 if (!isMRTcompressed)
                 {
-                    /* Skip AFI */
-                    UPDATE_AND_CHECK_LEN(actOff, 2, allAttrLen, 0)
-
-                    /* Skip SAFI */
-                    UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0)
+                    UPDATE_AND_CHECK_LEN(actOff, 3, allAttrLen, 0)
+                    parsedLen += 3;
                 }
 
-                /* Get length of nexthop */
+                /* Next-hop length */
                 nextHopLen = get_buf_char(buffer+actOff);
                 UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0)
+                parsedLen += 1;
 
-                /* Get string for IPv6 nexthop address */
-                if (inet_ntop(AF_INET6, buffer+actOff, entry->nextHop, 64) == NULL) 
+                /* Parse next-hop (we keep the first address if 32 bytes are present) */
+                if (nextHopLen == 16 || nextHopLen == 32)
                 {
-                    return 0;
+                    pack_ipv6_from_bytes((const uint8_t*)(buffer+actOff),
+                                         &entry->nextHop_address1, &entry->nextHop_address0);
                 }
-
-                UPDATE_AND_CHECK_LEN(actOff, nextHopLen, allAttrLen, 0);
-
-                if (isMRTcompressed)
+                else if (nextHopLen == 4)
                 {
-                    parsedLen = 1 + nextHopLen;
+                    pack_ipv4_from_bytes((const uint8_t*)(buffer+actOff),
+                                         &entry->nextHop_address1, &entry->nextHop_address0);
                 }
                 else
                 {
-                    /* Skip nb attached layers */
-                    UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0);
-                    parsedLen = 5 + nextHopLen;
+                    /* Unknown next-hop length, just skip it */
                 }
-                
 
+                UPDATE_AND_CHECK_LEN(actOff, nextHopLen, allAttrLen, 0)
+                parsedLen += nextHopLen;
+
+                /* Skip reserved byte */
+                UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0)
+                parsedLen += 1;
+
+                /* Parse NLRI prefixes */
                 while (parsedLen < attrLen)
-                { 
-                    /* Get the prefix length */
-                    ret = process_prefix(buffer+actOff, entry->pfxNLRI[entry->nbNLRI], AF_INET6);
-                    if (ret == -1)
+                {
+                    if (entry->nbNLRI >= MAX_NB_PREFIXES)
                     {
-                        return 0;
+                        /* Skip prefix */
+                        int pfxLen = get_buf_char(buffer+actOff);
+                        if (pfxLen > 128) return 0;
+                        int nbBytes = (pfxLen + 7) / 8;
+                        UPDATE_AND_CHECK_LEN(actOff, nbBytes + 1, allAttrLen, 0)
+                        parsedLen += nbBytes + 1;
+                        continue;
                     }
 
-                    UPDATE_AND_CHECK_LEN(actOff, ret, allAttrLen, 0)
-                    parsedLen += ret;
-                    
+                    int p_afi = (entry->afi == BGP_IPV4_AFI) ? AF_INET : AF_INET6;
+                    int consumed = process_prefix(buffer+actOff,
+                                                  &entry->nlri_address1[entry->nbNLRI],
+                                                  &entry->nlri_address0[entry->nbNLRI],
+                                                  &entry->nlri_prefix_len[entry->nbNLRI],
+                                                  p_afi);
+                    if (consumed == -1) return 0;
+
+                    UPDATE_AND_CHECK_LEN(actOff, consumed, allAttrLen, 0)
+                    parsedLen += consumed;
                     entry->nbNLRI++;
                 }
+
                 break;
+            }
 
             /* Case of IPv6 withdraw */
             case BGP_UPDATE_NLRI_UNREACH:
+            {
                 parsedLen = 0;
 
-                /* Skip AFI */
-                UPDATE_AND_CHECK_LEN(actOff, 2, allAttrLen, 0)
+                /* Skip AFI + SAFI */
+                UPDATE_AND_CHECK_LEN(actOff, 3, allAttrLen, 0)
+                parsedLen += 3;
 
-                /* Skip SAFI */
-                UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0)
-
-                parsedLen = 3;
-
+                /* Parse withdrawn NLRIs */
                 while (parsedLen < attrLen)
                 {
-                    /* Get te prefix length */
-                    ret = process_prefix(buffer+actOff, entry->pfxWithdraw[entry->nbWithdraw], AF_INET6);
-                    if (ret == -1)
+                    if (entry->nbWithdraw >= MAX_NB_PREFIXES)
                     {
-                        return 0;
+                        int pfxLen = get_buf_char(buffer+actOff);
+                        if (pfxLen > 128) return 0;
+                        int nbBytes = (pfxLen + 7) / 8;
+                        UPDATE_AND_CHECK_LEN(actOff, nbBytes + 1, allAttrLen, 0)
+                        parsedLen += nbBytes + 1;
+                        continue;
                     }
 
-                    UPDATE_AND_CHECK_LEN(actOff, ret, allAttrLen, 0)
-                    parsedLen += ret;
-                    
+                    int p_afi = (entry->afi == BGP_IPV4_AFI) ? AF_INET : AF_INET6;
+                    int consumed = process_prefix(buffer+actOff,
+                                                  &entry->withdraw_address1[entry->nbWithdraw],
+                                                  &entry->withdraw_address0[entry->nbWithdraw],
+                                                  &entry->withdraw_prefix_len[entry->nbWithdraw],
+                                                  p_afi);
+                    if (consumed == -1) return 0;
+
+                    UPDATE_AND_CHECK_LEN(actOff, consumed, allAttrLen, 0)
+                    parsedLen += consumed;
                     entry->nbWithdraw++;
                 }
 
                 break;
+            }
 
             /* Default case for unknown or OSEF attribute */
             default:

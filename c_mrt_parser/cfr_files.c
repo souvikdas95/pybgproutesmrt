@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <limits.h>
 #include <assert.h>
 #include "cfr_files.h"
 
@@ -65,6 +66,38 @@ CFRFILE *cfr_open(const char *path)
 	CFRFILE * retval = NULL;
 
 	// determine file format
+	if ((path == NULL) || (strcmp(path, "-") == 0))
+	{
+		/* dump from stdin */
+		gzFile f;
+		format = 2;  // skip specials 0, 1
+		while (format < CFR_NUM_FORMATS)
+		{
+			if (strcmp(cfr_extensions[format], ".gz") == 0)
+			{
+				break;
+			}
+			format++;
+		}
+
+		f = gzdopen(0, "rb");
+		if (f == NULL)
+		{
+			return NULL;
+		}
+
+		retval = (CFRFILE *)calloc(1, sizeof(CFRFILE));
+		if (retval == NULL)
+		{
+			gzclose(f);
+			return NULL;
+		}
+
+		retval->data2 = f;
+		retval->format = format;
+		return retval;
+	}
+
 	name_len = strlen(path);
 	format = 2;  // skip specials 0, 1 
 
@@ -80,36 +113,11 @@ CFRFILE *cfr_open(const char *path)
 	retval->error2 = 0;
 
 
-	if((path == NULL) || (strcmp(path, "-") == 0)) 
-	{
-		/* dump from stdin */
-		gzFile f;
-		while (format < CFR_NUM_FORMATS) 
-		{
-			if (strcmp(cfr_extensions[format], ".gz") == 0)
-			{
-				break;
-			}
-			format ++;
-		}
-
-		f = gzdopen(0, "r");
-
-		if(f == NULL) 
-		{
-			free(retval);
-			return (NULL);
-		}
-
-		retval->data2 = f;
-		retval->format = format;
-		return (retval);
-	}
 
 	while (format < CFR_NUM_FORMATS) 
 	{
     	ext_len = strlen(cfr_extensions[format]);
-    	if (strncmp(cfr_extensions[format], path+(name_len-ext_len), ext_len) == 0) 
+    	if (name_len >= ext_len && strncmp(cfr_extensions[format], path + (name_len - ext_len), ext_len) == 0) 
 		{
 			break;
 		}
@@ -128,7 +136,7 @@ CFRFILE *cfr_open(const char *path)
 		case 1:  // uncompressed
 		{
 			FILE * in;
-			in = fopen(path,"r");
+			in = fopen(path,"rb");
 
 			if (in == NULL) 
 			{ 
@@ -150,7 +158,7 @@ CFRFILE *cfr_open(const char *path)
 			retval->bz2_stream_end = 0;
 			
 			// get file
-			in = fopen(path,"r");
+			in = fopen(path,"rb");
 			if (in == NULL) 
 			{ 
 				free(retval);
@@ -160,11 +168,14 @@ CFRFILE *cfr_open(const char *path)
 			retval->data1 = in;
 			
 			// bzip2ify file
-			bzin = BZ2_bzReadOpen( &bzerror, in, 0, 0, NULL, 0); 
-			if (bzerror != BZ_OK) 
+			bzin = BZ2_bzReadOpen( &bzerror, in, 0, 0, NULL, 0);
+			if (bzerror != BZ_OK)
 			{
 				errno = bzerror;
-				BZ2_bzReadClose( &bzerror, bzin);
+				if (bzin != NULL)
+				{
+					BZ2_bzReadClose(&bzerror, bzin);
+				}
 				fclose(in);
 				free(retval);
 				return(NULL);
@@ -205,10 +216,16 @@ int cfr_close(CFRFILE *stream)
 	/**************************/
 	// Analog to 'fclose'.
 	// FIXME - why is stream->* set, then freed?
-	if (stream == NULL || stream->closed) 
+	if (stream == NULL)
 	{
 		errno = EBADF;
 		return -1;
+	}
+	if (stream->closed)
+	{
+		// Underlying handles were already closed (e.g., due to an error during read)
+		free(stream);
+		return 0;
 	}
 		
 	int retval = -1;
@@ -337,27 +354,37 @@ size_t cfr_read(void *ptr, size_t size, size_t nmemb, CFRFILE *stream)
 			}
 
 			// Other error...
+			stream->bz2_stream_end = 1;
 			stream->error2 = bzerror;
-			BZ2_bzReadClose( &bzerror, bzin );
-
-			if (bzerror != BZ_OK) 
-			{
-				stream->error2 = bzerror;
-			}
-
-			retval = fclose((FILE *)(stream->data1));
-			stream->error1 = retval;
-			stream->closed = 1;
+			stream->eof = 1;
 			return(0);
 		}
+
 		break;
 
 		case 3:  // gzip
 		{
 			gzFile in;
 			in = (gzFile)(stream->data2);
-			retval = gzread(in, ptr, size*nmemb);
-			if (retval != nmemb*size) 
+			// gzread() takes an unsigned int length; read in chunks to avoid overflow.
+			size_t requested = size * nmemb;
+			size_t total = 0;
+			while (total < requested)
+			{
+				unsigned int chunk = (unsigned int)((requested - total) > (size_t)UINT_MAX ? (size_t)UINT_MAX : (requested - total));
+				int r = gzread(in, (unsigned char*)ptr + total, chunk);
+				if (r <= 0)
+				{
+					break;
+				}
+				total += (size_t)r;
+				if ((unsigned int)r < chunk)
+				{
+					break;
+				}
+			}
+			retval = (int)total;
+			if ((size_t)retval != requested)
 			{
 				// fprintf(stderr,"short read!!!\n");
 				stream->eof = gzeof(in);

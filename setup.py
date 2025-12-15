@@ -30,7 +30,7 @@ update_library_directory("pybgproutesmrt/broker.py", libdir)
 
 setup(
     name='pybgproutesmrt',
-    version='0.1.2',
+    version='0.2',
     packages=find_packages(),
     install_requires=['requests>=2.24.0'],
     author='Thomas Holterbach and Thomas Alfroy',

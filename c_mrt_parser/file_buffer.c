@@ -173,28 +173,38 @@ void File_buf_close_dump(File_buf_t *dump)
 
 
 MRTentry* Read_next_mrt_entry(File_buf_t *dump)
-{   
+{
     MRTentry* tmp;
-    /* In case we read something at the previous iteration */
+
+    /* If we still have an already-parsed chain, stream through it */
     if (dump->actEntry)
     {
-        /* If there is still a next entry that has not been already read */
+        /* If there is still a next entry that has not been already returned */
         if (dump->actEntry->next)
         {
-            tmp = dump->actEntry->next;
-            dump->actEntry = dump->actEntry->next;
+            MRTentry* old = dump->actEntry;
+            tmp = old->next;
+
+            /* Advance cursor first */
+            dump->actEntry = tmp;
+
+            /* Detach and free the previous node to prevent memory growth */
+            old->next = NULL;
+            old->prev = NULL;
+            MRTentry_free_one(old);
+
             return tmp;
         }
-        /* If there is nothing left to read, free all entries */
+        /* No more linked entries: free the last node and parse a new MRT record */
         else
         {
-            MRTentry_free(dump->actEntry);
+            MRTentry_free_one(dump->actEntry);
+            dump->actEntry = NULL;
         }
     }
 
+    /* Allocate a new entry for the next MRT record */
     MRTentry* entry = MRTentry_new();
-    entry->dumper = dump;
-
     if (!entry)
     {
         printf("Unable to allocate any memory\n");
@@ -202,8 +212,13 @@ MRTentry* Read_next_mrt_entry(File_buf_t *dump)
         return NULL;
     }
 
+    /* Defensive init in case MRTentry_new() uses malloc instead of calloc */
+    entry->next = NULL;
+    entry->prev = NULL;
+    entry->dumper = dump;
+
     u_int32_t bytes_read;
-    u_int8_t ok=0;
+    u_int8_t ok = 0;
     u_int8_t* bgpMsgBuffer;
 
     bytes_read = cfr_read_n(dump->f, &entry->time, 4);
@@ -211,19 +226,19 @@ MRTentry* Read_next_mrt_entry(File_buf_t *dump)
     bytes_read += cfr_read_n(dump->f, &(entry->entrySubType), 2);
     bytes_read += cfr_read_n(dump->f, &(entry->entryLength), 4);
 
-    if (bytes_read == 12) 
+    if (bytes_read == 12)
     {
         /* Intel byte ordering stuff ... */
         entry->entryType = ntohs(entry->entryType);
         entry->entrySubType = ntohs(entry->entrySubType);
-        entry->time = (time_t) ntohl (entry->time);
+        entry->time = (time_t)ntohl(entry->time);
         entry->entryLength = ntohl(entry->entryLength);
-        
-        /* If Extended Header format, then reading the miscroseconds attribute */
-        if (entry->entryType == MRT_TYPE_BGP4MP_ET) 
+
+        /* If Extended Header format, then reading the microseconds attribute */
+        if (entry->entryType == MRT_TYPE_BGP4MP_ET)
         {
             bytes_read += cfr_read_n(dump->f, &(entry->time_ms), 4);
-            if (bytes_read == 16) 
+            if (bytes_read == 16)
             {
                 entry->time_ms = ntohl(entry->time_ms);
                 /* "The Microsecond Timestamp is included in the computation of
@@ -231,62 +246,59 @@ MRTentry* Read_next_mrt_entry(File_buf_t *dump)
                 entry->entryLength -= 4;
                 ok = 1;
             }
-        } 
-        else 
+        }
+        else
         {
             entry->time_ms = 0;
             ok = 1;
         }
     }
 
-
-    if (!ok) 
+    if (!ok)
     {
-        if(bytes_read > 0) 
+        if (bytes_read > 0)
         {
-            /* Malformed record */
             printf("Incomplete MRT header (%d bytes read, expecting 12 or 16)\n", bytes_read);
         }
-        /* Nothing more to read, quit */
         MRTentry_free(entry);
         dump->eof = 1;
         dump->actEntry = NULL;
-        return(NULL);
+        return NULL;
     }
 
     dump->parsed++;
 
-    if(entry->entryLength == 0) 
+    if (entry->entryLength == 0)
     {
-        printf("Iinvalid entry length: 0\n");
+        printf("Invalid entry length: 0\n");
         MRTentry_free(entry);
         dump->eof = 1;
         dump->actEntry = NULL;
-        return(NULL);
+        return NULL;
     }
 
-    if ((bgpMsgBuffer = malloc(entry->entryLength)) == NULL) 
+    bgpMsgBuffer = (u_int8_t*)malloc(entry->entryLength);
+    if (!bgpMsgBuffer)
     {
         printf("Out of memory\n");
         MRTentry_free(entry);
         dump->eof = 1;
         dump->actEntry = NULL;
-        return(NULL);
+        return NULL;
     }
 
     bytes_read = cfr_read_n(dump->f, bgpMsgBuffer, entry->entryLength);
-
-    if(bytes_read != entry->entryLength) 
+    if (bytes_read != entry->entryLength)
     {
-	    printf("Incomplete dump record (%d bytes read, expecting %d)\n", bytes_read, entry->entryLength);
+        printf("Incomplete dump record (%d bytes read, expecting %d)\n", bytes_read, entry->entryLength);
         MRTentry_free(entry);
         free(bgpMsgBuffer);
         dump->eof = 1;
         dump->actEntry = NULL;
-        return(NULL);
+        return NULL;
     }
 
-    switch(entry->entryType) 
+    switch (entry->entryType)
     {
         case MRT_TYPE_BGP4MP:
         case MRT_TYPE_BGP4MP_ET:
@@ -296,28 +308,31 @@ MRTentry* Read_next_mrt_entry(File_buf_t *dump)
         case MRT_TYPE_TABLE_DUMP_V2:
             ok = process_bgp_rib(bgpMsgBuffer, entry, entry->entryLength);
             break;
-        
+
         default:
             printf("Sorry MRT type not handled\n");
+            ok = 0;
             break;
     }
 
     free(bgpMsgBuffer);
 
-    if(ok) 
+    if (ok)
     {
-	    dump->parsed_ok++;
-    } 
-    else 
+        dump->parsed_ok++;
+    }
+    else
     {
         MRTentry_free(entry);
         dump->actEntry = NULL;
         return NULL;
     }
 
+    /* Set current cursor to the head of the returned chain */
     dump->actEntry = entry;
     return entry;
 }
+
 
 
 

@@ -18,7 +18,7 @@
 
 /* ===== Binary (non-string) storage limits ===== */
 #define MAX_ASPATH_ASNS 256
-#define MAX_ASPATH_SEGS 64
+#define MAX_ASPATH_SEGS 16
 
 /* Up to 4096 bytes of community payload:
  *  - classic communities (4B): 1024 values

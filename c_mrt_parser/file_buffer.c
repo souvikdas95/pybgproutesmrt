@@ -99,6 +99,19 @@ void get_buf_n(u_char* buf, char* dest, int n)
     }
 }
 
+static inline int socket_afi_from_bgp_afi(uint16_t bgp_afi)
+{
+    if (bgp_afi == BGP_IPV4_AFI)
+    {
+        return AF_INET;
+    }
+    else if (bgp_afi == BGP_IPV6_AFI)
+    {
+        return AF_INET6;
+    }
+
+    return -1;
+}
 
 
 int process_prefix(u_char* buffer, uint64_t* address1, uint64_t* address0, uint8_t* prefix_len, int afi)
@@ -106,7 +119,7 @@ int process_prefix(u_char* buffer, uint64_t* address1, uint64_t* address0, uint8
     /* Prefix length is in bits */
     int pfxLen = get_buf_char(buffer);
 
-    if (pfxLen > 128)
+    if ((afi == AF_INET && pfxLen > 32) || (afi == AF_INET6 && pfxLen > 128))
     {
         return -1;
     }
@@ -133,6 +146,349 @@ int process_prefix(u_char* buffer, uint64_t* address1, uint64_t* address0, uint8
     }
 
     return -1;
+}
+
+
+
+typedef struct
+{
+    uint8_t  present;
+    uint8_t  asn_count;
+    uint8_t  seg_count;
+    uint32_t asn[MAX_ASPATH_ASNS];
+    uint8_t  seg_type[MAX_ASPATH_SEGS];
+    uint8_t  seg_len[MAX_ASPATH_SEGS];
+    uint8_t  seg_off[MAX_ASPATH_SEGS];
+} Parsed_aspath_t;
+
+static inline void parsed_aspath_reset(Parsed_aspath_t* p)
+{
+    memset(p, 0, sizeof(*p));
+}
+
+static inline int is_confed_seg(uint8_t t)
+{
+    return (t == BGP_AS_PATH_SEG_CONFED_SEQUENCE) || (t == BGP_AS_PATH_SEG_CONFED_SET);
+}
+
+/* "Number of AS numbers" per RFC 6793: use the path length calculation from
+ * RFC 4271 9.1.2.2 (AS_SEQUENCE counts all ASNs, AS_SET counts as 1, confed segments ignored). */
+static int aspath_metric(const Parsed_aspath_t* p)
+{
+    int m = 0;
+    for (uint8_t s = 0; s < p->seg_count; s++)
+    {
+        uint8_t t = p->seg_type[s];
+        uint8_t l = p->seg_len[s];
+
+        if (t == BGP_UPDATE_AS_PATH_SEQ)
+        {
+            m += (int)l;
+        }
+        else if (t == BGP_UPDATE_AS_PATH_SET)
+        {
+            if (l > 0) m += 1;
+        }
+        else
+        {
+            /* AS_CONFED_*: ignored */
+        }
+    }
+    return m;
+}
+
+static inline void aspath_append_segment(Parsed_aspath_t* dst, uint8_t segType, const uint32_t* asns, uint8_t segLen)
+{
+    if (segLen == 0) return;
+
+    /* record segment metadata (best-effort) */
+    if (dst->seg_count < MAX_ASPATH_SEGS)
+    {
+        dst->seg_type[dst->seg_count] = segType;
+        dst->seg_len[dst->seg_count]  = segLen;
+        dst->seg_off[dst->seg_count]  = dst->asn_count;
+        dst->seg_count++;
+    }
+
+    /* append ASNs (best-effort) */
+    for (uint8_t i = 0; i < segLen; i++)
+    {
+        if (dst->asn_count < MAX_ASPATH_ASNS)
+        {
+            dst->asn[dst->asn_count++] = asns[i];
+        }
+    }
+}
+
+static inline void aspath_append_path(Parsed_aspath_t* dst, const Parsed_aspath_t* src)
+{
+    for (uint8_t s = 0; s < src->seg_count; s++)
+    {
+        uint8_t t = src->seg_type[s];
+        uint8_t l = src->seg_len[s];
+        uint8_t o = src->seg_off[s];
+        if (o + l <= src->asn_count)
+        {
+            aspath_append_segment(dst, t, &src->asn[o], l);
+        }
+        else if (o < src->asn_count)
+        {
+            /* defensive clamp on malformed metadata */
+            uint8_t clamp = (uint8_t)(src->asn_count - o);
+            aspath_append_segment(dst, t, &src->asn[o], clamp);
+        }
+    }
+}
+
+/* Parse AS_PATH / AS4_PATH payload into a local representation.
+ * Returns:
+ *   1  success
+ *   0  hard bounds error (caller should abort)
+ *  -1  malformed attribute (caller should discard this attribute and continue)
+ */
+static int parse_aspath_attr_payload(const u_char* buffer,
+                                    uint32_t* actOff,
+                                    uint32_t limit,
+                                    uint16_t attrLen,
+                                    int asnBytes,
+                                    int drop_confed,
+                                    Parsed_aspath_t* out)
+{
+    uint32_t off = *actOff;
+    uint16_t parsed = 0;
+
+    parsed_aspath_reset(out);
+    out->present = 1;
+
+    while (parsed < attrLen)
+    {
+        if (parsed + 2 > attrLen)
+        {
+            /* Malformed: header truncated */
+            off += (uint32_t)(attrLen - parsed);
+            if (off > limit) return 0;
+            *actOff = off;
+            return -1;
+        }
+
+        uint8_t segType = buffer[off++];
+        if (off > limit) return 0;
+        uint8_t segLen  = buffer[off++];
+        if (off > limit) return 0;
+        parsed += 2;
+
+        if (segLen == 0)
+        {
+            /* Malformed per RFC 6793 */
+            off += (uint32_t)(attrLen - parsed);
+            if (off > limit) return 0;
+            *actOff = off;
+            return -1;
+        }
+
+        uint32_t needBytes = (uint32_t)segLen * (uint32_t)asnBytes;
+        if ((uint32_t)parsed + needBytes > (uint32_t)attrLen)
+        {
+            /* Malformed length */
+            off += (uint32_t)(attrLen - parsed);
+            if (off > limit) return 0;
+            *actOff = off;
+            return -1;
+        }
+
+        /* Drop confed segments from AS4_PATH (RFC 6793, Section 4.2.2/6) */
+        if (drop_confed && is_confed_seg(segType))
+        {
+            off += needBytes;
+            if (off > limit) return 0;
+            parsed = (uint16_t)(parsed + needBytes);
+            continue;
+        }
+
+        /* Accept only known segment types */
+        if (!(segType == BGP_UPDATE_AS_PATH_SET ||
+              segType == BGP_UPDATE_AS_PATH_SEQ ||
+              segType == BGP_AS_PATH_SEG_CONFED_SEQUENCE ||
+              segType == BGP_AS_PATH_SEG_CONFED_SET))
+        {
+            off += (uint32_t)(attrLen - parsed);
+            if (off > limit) return 0;
+            *actOff = off;
+            return -1;
+        }
+
+        if (out->seg_count < MAX_ASPATH_SEGS)
+        {
+            out->seg_type[out->seg_count] = segType;
+            out->seg_len[out->seg_count]  = segLen;
+            out->seg_off[out->seg_count]  = out->asn_count;
+            out->seg_count++;
+        }
+
+        for (uint8_t i = 0; i < segLen; i++)
+        {
+            uint32_t asn_val = 0;
+
+            if (asnBytes == 2)
+            {
+                asn_val = (uint32_t)get_buf_short((u_char*)(buffer + off));
+                off += 2;
+                if (off > limit) return 0;
+                parsed += 2;
+            }
+            else
+            {
+                asn_val = (uint32_t)get_buf_int((u_char*)(buffer + off));
+                off += 4;
+                if (off > limit) return 0;
+                parsed += 4;
+            }
+
+            if (out->asn_count < MAX_ASPATH_ASNS)
+            {
+                out->asn[out->asn_count++] = asn_val;
+            }
+        }
+    }
+
+    *actOff = off;
+    return 1;
+}
+
+/* Build the RFC6793-reconstructed AS path from AS_PATH and AS4_PATH. */
+static void reconstruct_aspath(Parsed_aspath_t* out,
+                              const Parsed_aspath_t* as_path,
+                              const Parsed_aspath_t* as4_path)
+{
+    Parsed_aspath_t prefix;
+    parsed_aspath_reset(out);
+    parsed_aspath_reset(&prefix);
+
+    if (as_path && as_path->present && (!as4_path || !as4_path->present))
+    {
+        aspath_append_path(out, as_path);
+        return;
+    }
+    if (as4_path && as4_path->present && (!as_path || !as_path->present))
+    {
+        aspath_append_path(out, as4_path);
+        return;
+    }
+    if (!as_path || !as4_path || !as_path->present || !as4_path->present)
+    {
+        return;
+    }
+
+    int m2 = aspath_metric(as_path);
+    int m4 = aspath_metric(as4_path);
+
+    /* If AS_PATH "length" < AS4_PATH "length", ignore AS4_PATH (RFC 6793 4.2.3). */
+    if (m2 < m4)
+    {
+        aspath_append_path(out, as_path);
+        return;
+    }
+
+    int need = m2 - m4;
+
+    /* Always keep leading confed segments from AS_PATH (excluded from AS4_PATH). */
+    uint8_t s = 0;
+    while (s < as_path->seg_count && is_confed_seg(as_path->seg_type[s]))
+    {
+        uint8_t o = as_path->seg_off[s];
+        uint8_t l = as_path->seg_len[s];
+        if (o < as_path->asn_count)
+        {
+            uint8_t clamp = (uint8_t)((o + l <= as_path->asn_count) ? l : (as_path->asn_count - o));
+            aspath_append_segment(&prefix, as_path->seg_type[s], &as_path->asn[o], clamp);
+        }
+        s++;
+    }
+
+    int remaining = need;
+    int ended_mid_segment = 0;
+
+    /* Take as many leading segments / ASNs as necessary from AS_PATH to reach "need". */
+    while (remaining > 0 && s < as_path->seg_count)
+    {
+        uint8_t t = as_path->seg_type[s];
+        uint8_t o = as_path->seg_off[s];
+        uint8_t l = as_path->seg_len[s];
+
+        if (o >= as_path->asn_count) break;
+
+        uint8_t clamp = (uint8_t)((o + l <= as_path->asn_count) ? l : (as_path->asn_count - o));
+        const uint32_t* asns = &as_path->asn[o];
+
+        if (is_confed_seg(t))
+        {
+            /* Adjacent confed segment */
+            aspath_append_segment(&prefix, t, asns, clamp);
+            s++;
+            continue;
+        }
+
+        if (t == BGP_UPDATE_AS_PATH_SET)
+        {
+            /* AS_SET counts as 1 in metric */
+            aspath_append_segment(&prefix, t, asns, clamp);
+            remaining -= 1;
+            s++;
+            continue;
+        }
+
+        /* Treat everything else as AS_SEQUENCE-like for reconstruction */
+        uint8_t take = (clamp <= (uint8_t)remaining) ? clamp : (uint8_t)remaining;
+        aspath_append_segment(&prefix, t, asns, take);
+        remaining -= (int)take;
+
+        if (take < clamp)
+        {
+            ended_mid_segment = 1;
+            break;
+        }
+
+        s++;
+    }
+
+    /* If we ended exactly on a segment boundary, also prepend immediately-adjacent confed segments. */
+    if (!ended_mid_segment)
+    {
+        while (s < as_path->seg_count && is_confed_seg(as_path->seg_type[s]))
+        {
+            uint8_t o = as_path->seg_off[s];
+            uint8_t l = as_path->seg_len[s];
+            if (o < as_path->asn_count)
+            {
+                uint8_t clamp = (uint8_t)((o + l <= as_path->asn_count) ? l : (as_path->asn_count - o));
+                aspath_append_segment(&prefix, as_path->seg_type[s], &as_path->asn[o], clamp);
+            }
+            s++;
+        }
+    }
+
+    aspath_append_path(out, &prefix);
+    aspath_append_path(out, as4_path);
+}
+
+static void commit_aspath_to_entry(MRTentry* entry, const Parsed_aspath_t* p)
+{
+    entry->asPathLen      = p->asn_count;
+    entry->asPathSegCount = p->seg_count;
+
+    /* Copy flattened ASNs */
+    for (uint8_t i = 0; i < p->asn_count; i++)
+    {
+        entry->asPath[i] = p->asn[i];
+    }
+
+    /* Copy segment metadata */
+    for (uint8_t s = 0; s < p->seg_count; s++)
+    {
+        entry->asPathSegType[s]   = p->seg_type[s];
+        entry->asPathSegLen[s]    = p->seg_len[s];
+        entry->asPathSegOffset[s] = p->seg_off[s];
+    }
 }
 
 
@@ -797,10 +1153,18 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
     uint16_t attrLen;
     int parsedLen;
     uint8_t val;
-    uint8_t segType;
-    uint8_t segLen;
+    // uint8_t segType;
+    // uint8_t segLen;
     uint8_t nextHopLen;
     uint8_t isMRTcompressed;
+
+    /* Delay AS_PATH/AS4_PATH resolution until we've seen both attributes. */
+    Parsed_aspath_t parsed_as_path;
+    Parsed_aspath_t parsed_as4_path;
+    Parsed_aspath_t final_as_path;
+    parsed_aspath_reset(&parsed_as_path);
+    parsed_aspath_reset(&parsed_as4_path);
+    parsed_aspath_reset(&final_as_path);
 
 
     while (actAllAttrLen < allAttrLen)
@@ -850,21 +1214,15 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
                 break;
             }
 
-            /* Parsing the AS path */
+            /* Parsing AS_PATH / AS4_PATH (RFC 6793 reconstruction) */
             case BGP_UPDATE_ATTR_AS_PATH:
             case BGP_UPDATE_ATTR_AS4_PATH:
             {
-                segType   = 0;
-                segLen    = 0;
-                parsedLen = 0;
+                Parsed_aspath_t* dst = (attrType == BGP_UPDATE_ATTR_AS4_PATH) ? &parsed_as4_path : &parsed_as_path;
 
                 /* Determine ASN width */
-                int asnBytes = 0;
-                if (attrType == BGP_UPDATE_ATTR_AS4_PATH)
-                {
-                    asnBytes = 4;
-                }
-                else
+                int asnBytes = 4;
+                if (attrType == BGP_UPDATE_ATTR_AS_PATH)
                 {
                     if (entry->entrySubType == MRT_SUBTYPE_BGP4MP_MESSAGE ||
                         entry->entrySubType == MRT_SUBTYPE_BGP4MP_MESSAGE_LOCAL)
@@ -877,52 +1235,24 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
                     }
                 }
 
-                /* Reset any previous AS-PATH data (defensive) */
-                entry->asPathLen = 0;
-                entry->asPathSegCount = 0;
-
-                while (parsedLen < attrLen)
+                /* If a duplicate attribute is seen, skip it (best-effort). */
+                if (dst->present)
                 {
-                    segType = get_buf_char(buffer+actOff);
-                    UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0)
+                    UPDATE_AND_CHECK_LEN(actOff, attrLen, allAttrLen, 0)
+                    break;
+                }
 
-                    segLen = get_buf_char(buffer+actOff);
-                    UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0)
+                int drop_confed = (attrType == BGP_UPDATE_ATTR_AS4_PATH) ? 1 : 0;
+                int st = parse_aspath_attr_payload(buffer, &actOff, (uint32_t)allAttrLen, attrLen, asnBytes, drop_confed, dst);
 
-                    parsedLen += 2;
-
-                    /* Record segment metadata if possible */
-                    if (entry->asPathSegCount < MAX_ASPATH_SEGS)
-                    {
-                        entry->asPathSegType[entry->asPathSegCount] = (uint8_t)segType;
-                        entry->asPathSegLen[entry->asPathSegCount]  = (uint8_t)segLen;
-                        entry->asPathSegOffset[entry->asPathSegCount] = entry->asPathLen;
-                        entry->asPathSegCount++;
-                    }
-
-                    /* Parse ASNs in the segment */
-                    for (int i = 0; i < segLen; i++)
-                    {
-                        uint32_t asn_val = 0;
-
-                        if (asnBytes == 2)
-                        {
-                            asn_val = (uint32_t)get_buf_short(buffer+actOff);
-                            UPDATE_AND_CHECK_LEN(actOff, 2, allAttrLen, 0)
-                            parsedLen += 2;
-                        }
-                        else
-                        {
-                            asn_val = (uint32_t)get_buf_int(buffer+actOff);
-                            UPDATE_AND_CHECK_LEN(actOff, 4, allAttrLen, 0)
-                            parsedLen += 4;
-                        }
-
-                        if (entry->asPathLen < MAX_ASPATH_ASNS)
-                        {
-                            entry->asPath[entry->asPathLen++] = asn_val;
-                        }
-                    }
+                if (st == 0)
+                {
+                    return 0; /* bounds error */
+                }
+                if (st < 0)
+                {
+                    /* Malformed attribute: discard AS4_PATH per RFC 6793; for AS_PATH keep empty. */
+                    dst->present = 0;
                 }
 
                 break;
@@ -1042,6 +1372,9 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
             /* Parse MP NRLI REACH, i.e., parse IPv6 nexthop and prefixes */
             case BGP_UPDATE_ATTR_NLRI:
             {
+                uint16_t mp_afi = 0;
+                int p_afi = -1;
+
                 parsedLen = 0;
 
                 /* 
@@ -1054,9 +1387,16 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
                     isMRTcompressed = true;
                 }
 
-                /* Skip AFI + SAFI if present */
+                /* Parse AFI + SAFI if present and use that AFI for NLRI decoding. */
                 if (!isMRTcompressed)
                 {
+                    mp_afi = get_buf_short(buffer+actOff);
+                    p_afi = socket_afi_from_bgp_afi(mp_afi);
+                    if (p_afi == -1)
+                    {
+                        return 0;
+                    }
+
                     UPDATE_AND_CHECK_LEN(actOff, 3, allAttrLen, 0)
                     parsedLen += 3;
                 }
@@ -1065,6 +1405,22 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
                 nextHopLen = get_buf_char(buffer+actOff);
                 UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0)
                 parsedLen += 1;
+
+                if (isMRTcompressed)
+                {
+                    if (nextHopLen == 4)
+                    {
+                        p_afi = AF_INET;
+                    }
+                    else if (nextHopLen == 16 || nextHopLen == 32)
+                    {
+                        p_afi = AF_INET6;
+                    }
+                    else
+                    {
+                        return 0;
+                    }
+                }
 
                 /* Parse next-hop (we keep the first address if 32 bytes are present) */
                 if (nextHopLen == 16 || nextHopLen == 32)
@@ -1096,14 +1452,13 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
                     {
                         /* Skip prefix */
                         int pfxLen = get_buf_char(buffer+actOff);
-                        if (pfxLen > 128) return 0;
+                        if ((p_afi == AF_INET && pfxLen > 32) || (p_afi == AF_INET6 && pfxLen > 128)) return 0;
                         int nbBytes = (pfxLen + 7) / 8;
                         UPDATE_AND_CHECK_LEN(actOff, nbBytes + 1, allAttrLen, 0)
                         parsedLen += nbBytes + 1;
                         continue;
                     }
 
-                    int p_afi = (entry->afi == BGP_IPV4_AFI) ? AF_INET : AF_INET6;
                     int consumed = process_prefix(buffer+actOff,
                                                   &entry->nlri_address1[entry->nbNLRI],
                                                   &entry->nlri_address0[entry->nbNLRI],
@@ -1122,7 +1477,17 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
             /* Case of IPv6 withdraw */
             case BGP_UPDATE_NLRI_UNREACH:
             {
+                uint16_t mp_afi = 0;
+                int p_afi = -1;
+
                 parsedLen = 0;
+
+                mp_afi = get_buf_short(buffer+actOff);
+                p_afi = socket_afi_from_bgp_afi(mp_afi);
+                if (p_afi == -1)
+                {
+                    return 0;
+                }
 
                 /* Skip AFI + SAFI */
                 UPDATE_AND_CHECK_LEN(actOff, 3, allAttrLen, 0)
@@ -1134,14 +1499,13 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
                     if (entry->nbWithdraw >= MAX_NB_PREFIXES)
                     {
                         int pfxLen = get_buf_char(buffer+actOff);
-                        if (pfxLen > 128) return 0;
+                        if ((p_afi == AF_INET && pfxLen > 32) || (p_afi == AF_INET6 && pfxLen > 128)) return 0;
                         int nbBytes = (pfxLen + 7) / 8;
                         UPDATE_AND_CHECK_LEN(actOff, nbBytes + 1, allAttrLen, 0)
                         parsedLen += nbBytes + 1;
                         continue;
                     }
 
-                    int p_afi = (entry->afi == BGP_IPV4_AFI) ? AF_INET : AF_INET6;
                     int consumed = process_prefix(buffer+actOff,
                                                   &entry->withdraw_address1[entry->nbWithdraw],
                                                   &entry->withdraw_address0[entry->nbWithdraw],
@@ -1163,6 +1527,25 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
         }
 
         actAllAttrLen += attrLen;
+    }
+
+    /* Finalize AS_PATH reconstruction once all attributes are parsed (order-independent). */
+    if (parsed_as_path.present || parsed_as4_path.present)
+    {
+        reconstruct_aspath(&final_as_path, &parsed_as_path, &parsed_as4_path);
+        commit_aspath_to_entry(entry, &final_as_path);
+        // fprintf(stderr, "DBG segCount=%u segType0=%u segOff0=%u segLen0=%u asLen=%u\n",
+        //     entry->asPathSegCount,
+        //     entry->asPathSegCount ? entry->asPathSegType[0] : 0,
+        //     entry->asPathSegCount ? entry->asPathSegOffset[0] : 0,
+        //     entry->asPathSegCount ? entry->asPathSegLen[0] : 0,
+        //     entry->asPathLen
+        // );
+    }
+    else
+    {
+        entry->asPathLen = 0;
+        entry->asPathSegCount = 0;
     }
 
     return actOff;

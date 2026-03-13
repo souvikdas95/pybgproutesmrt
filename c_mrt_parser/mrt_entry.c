@@ -109,16 +109,42 @@ static void aspath_to_str(const MRTentry* e, char* out, size_t outlen)
     int off = 0;
     out[0] = '\0';
 
-    /* If we have segment metadata, use it. Otherwise fall back to flat list. */
-    if (e->asPathSegCount > 0)
-    {
-        for (uint8_t s = 0; s < e->asPathSegCount; s++)
-        {
-            uint8_t stype = e->asPathSegType[s];
-            uint8_t slen  = e->asPathSegLen[s];
-            uint8_t base = e->asPathSegOffset[s];
+    const uint8_t n = (uint8_t)e->asPathLen;
+    const uint8_t sc = (uint8_t)e->asPathSegCount;
 
-            if (s > 0) buf_append(out, &off, (int)outlen, " ");
+    /* Decide if segment metadata is usable. */
+    int seg_ok = 1;
+    if (sc == 0) {
+        seg_ok = 0;
+    } else {
+        for (uint8_t s = 0; s < sc; s++) {
+            const uint8_t stype = e->asPathSegType[s];
+            const uint8_t slen  = e->asPathSegLen[s];
+            const uint8_t base  = e->asPathSegOffset[s];
+
+            /* Valid AS_PATH segment types: 1..4 (SET, SEQ, CONFED_SEQ, CONFED_SET). */
+            if (!(stype >= 1 && stype <= 4)) { seg_ok = 0; break; }
+
+            /* Must describe at least one ASN and be within bounds. */
+            if (slen == 0) { seg_ok = 0; break; }
+            if (base >= n) { seg_ok = 0; break; }
+
+            /* Prevent overflow and out-of-range. */
+            if ((uint16_t)base + (uint16_t)slen > (uint16_t)n) { seg_ok = 0; break; }
+        }
+    }
+
+    if (seg_ok)
+    {
+        int wrote_any = 0;
+
+        for (uint8_t s = 0; s < sc; s++)
+        {
+            const uint8_t stype = e->asPathSegType[s];
+            const uint8_t slen  = e->asPathSegLen[s];
+            const uint8_t base  = e->asPathSegOffset[s];
+
+            if (wrote_any) buf_append(out, &off, (int)outlen, " ");
 
             if (stype == BGP_UPDATE_AS_PATH_SET)
             {
@@ -126,8 +152,8 @@ static void aspath_to_str(const MRTentry* e, char* out, size_t outlen)
                 for (uint8_t i = 0; i < slen; i++)
                 {
                     if (i > 0) buf_append(out, &off, (int)outlen, ",");
-                    uint8_t idx = (uint8_t)(base + i);
-                    if (idx < e->asPathLen) buf_append(out, &off, (int)outlen, "%" PRIu32, e->asPath[idx]);
+                    const uint8_t idx = (uint8_t)(base + i);
+                    buf_append(out, &off, (int)outlen, "%" PRIu32, e->asPath[idx]);
                 }
                 buf_append(out, &off, (int)outlen, "}");
             }
@@ -136,19 +162,27 @@ static void aspath_to_str(const MRTentry* e, char* out, size_t outlen)
                 for (uint8_t i = 0; i < slen; i++)
                 {
                     if (i > 0) buf_append(out, &off, (int)outlen, " ");
-                    uint8_t idx = (uint8_t)(base + i);
-                    if (idx < e->asPathLen) buf_append(out, &off, (int)outlen, "%" PRIu32, e->asPath[idx]);
+                    const uint8_t idx = (uint8_t)(base + i);
+                    buf_append(out, &off, (int)outlen, "%" PRIu32, e->asPath[idx]);
                 }
             }
+
+            wrote_any = 1;
         }
+
+        /* If segment branch produced nothing for any reason, fall back. */
+        if (out[0] != '\0') return;
+
+        /* else fall through to flat list */
+        off = 0;
+        out[0] = '\0';
     }
-    else
+
+    /* Flat list fallback (robust even if seg meta is broken). */
+    for (uint8_t i = 0; i < n; i++)
     {
-        for (uint8_t i = 0; i < e->asPathLen; i++)
-        {
-            if (i > 0) buf_append(out, &off, (int)outlen, " ");
-            buf_append(out, &off, (int)outlen, "%" PRIu32, e->asPath[i]);
-        }
+        if (i > 0) buf_append(out, &off, (int)outlen, " ");
+        buf_append(out, &off, (int)outlen, "%" PRIu32, e->asPath[i]);
     }
 }
 

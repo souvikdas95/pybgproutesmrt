@@ -52,3 +52,7 @@
 #define BGP_UPDATE_AS_PATH_SET          0x01
 #define BGP_UPDATE_CODE_NEXTHOP         0x03
 
+/* ========= AS_PATH / AS4_PATH reconstruction (RFC 6793) ========= */
+#define BGP_AS_PATH_SEG_CONFED_SEQUENCE 0x03
+#define BGP_AS_PATH_SEG_CONFED_SET      0x04
+#define BGP_AS_TRANS                    23456u  /* reserved 2-octet AS number */

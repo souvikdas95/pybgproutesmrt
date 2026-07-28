@@ -32,17 +32,29 @@ static inline void pack_ipv6_from_bytes(const uint8_t* p, uint64_t* a1, uint64_t
 
 static inline void pack_128_from_bytes_be(const uint8_t* p, uint8_t n, uint64_t* hi, uint64_t* lo)
 {
-    /* Pack up to 16 bytes into (hi, lo). Bytes beyond n are treated as 0.
-     * Bytes are interpreted as big-endian at their position.
+    /* Pack up to 16 bytes into (hi, lo).
+     *
+     * The input bytes are interpreted as one big-endian integer of length n
+     * and right-aligned inside the 128-bit lane:
+     *
+     *   (hi, lo) = zero_pad_left(p[0..n-1])
+     *
+     * Example for n = 12:
+     *   hi = 0x00000000 || p[0..3]
+     *   lo = p[4..7]   || p[8..11]
+     *
+     * This makes a large community:
+     *   global_admin -> low 32 bits of hi
+     *   local_data1  -> high 32 bits of lo
+     *   local_data2  -> low 32 bits of lo
      */
     uint8_t tmp[16];
     memset(tmp, 0, 16);
     if (n > 16) n = 16;
-    if (n > 0) memcpy(tmp, p, n);
+    if (n > 0) memcpy(tmp + (16 - n), p, n);    // memcpy(tmp, p, n);
     *hi = pack_u64_be(tmp);
     *lo = pack_u64_be(tmp + 8);
 }
-
 
 void print_raw_bgp_message(u_char* buffer, int len, uint16_t type, uint16_t subType)
 {   

@@ -1389,6 +1389,66 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
 
                 parsedLen = 0;
 
+                /*
+                 * RFC 6396 section 4.3.4 gives MP_REACH_NLRI a special
+                 * encoding inside TABLE_DUMP_V2 RIB entries: AFI, SAFI,
+                 * NLRI, and even the normal Reserved octet are omitted.
+                 * The attribute payload contains only:
+                 *
+                 *     Next Hop Address Length | Next Hop Address
+                 *
+                 * The prefix/NLRI is already carried by the RIB record
+                 * header.  Do not append anything to entry->nbNLRI here.
+                 *
+                 * The old parser treated this compact form like a normal
+                 * MP_REACH_NLRI after the next hop and unconditionally
+                 * skipped a Reserved octet.  That consumed the first byte
+                 * of the following attribute, desynchronized attr parsing,
+                 * and could fabricate enormous numbers of NLRI/withdrawals.
+                 */
+                if (entry->entryType == MRT_TYPE_TABLE_DUMP_V2)
+                {
+                    if (attrLen < 1)
+                    {
+                        return 0;
+                    }
+
+                    nextHopLen = get_buf_char(buffer+actOff);
+                    UPDATE_AND_CHECK_LEN(actOff, 1, allAttrLen, 0)
+                    parsedLen += 1;
+
+                    if ((uint32_t)parsedLen + (uint32_t)nextHopLen > (uint32_t)attrLen)
+                    {
+                        return 0;
+                    }
+
+                    /* Preserve the next hop for callers that use it. */
+                    if (nextHopLen == 16 || nextHopLen == 32)
+                    {
+                        pack_ipv6_from_bytes((const uint8_t*)(buffer+actOff),
+                                             &entry->nextHop_address1, &entry->nextHop_address0);
+                    }
+                    else if (nextHopLen == 4)
+                    {
+                        pack_ipv4_from_bytes((const uint8_t*)(buffer+actOff),
+                                             &entry->nextHop_address1, &entry->nextHop_address0);
+                    }
+
+                    UPDATE_AND_CHECK_LEN(actOff, nextHopLen, allAttrLen, 0)
+                    parsedLen += nextHopLen;
+
+                    /* RFC 6396 says the compact RIB form ends here.
+                     * Be forward-tolerant if an implementation includes
+                     * extra bytes, but never interpret them as NLRI. */
+                    if (parsedLen < attrLen)
+                    {
+                        UPDATE_AND_CHECK_LEN(actOff, attrLen - parsedLen, allAttrLen, 0)
+                        parsedLen = attrLen;
+                    }
+
+                    break;
+                }
+
                 /* 
                  * Handle truncated MP_REACH in some MRT encodings (no AFI/SAFI fields).
                  * If first byte is non-zero, treat as "compressed" and skip AFI/SAFI parsing.
@@ -1493,6 +1553,17 @@ int process_bgp_attributes(u_char* buffer, MRTentry* entry, int allAttrLen)
                 int p_afi = -1;
 
                 parsedLen = 0;
+
+                /* A TABLE_DUMP_V2 RIB is a snapshot of reachable routes.
+                 * Its prefix is in the RIB record header; MP_UNREACH must
+                 * never manufacture withdrawals in the generated snapshot.
+                 * If such an attribute is present, preserve parser alignment
+                 * by skipping its payload without touching nbWithdraw. */
+                if (entry->entryType == MRT_TYPE_TABLE_DUMP_V2)
+                {
+                    UPDATE_AND_CHECK_LEN(actOff, attrLen, allAttrLen, 0)
+                    break;
+                }
 
                 mp_afi = get_buf_short(buffer+actOff);
                 p_afi = socket_afi_from_bgp_afi(mp_afi);

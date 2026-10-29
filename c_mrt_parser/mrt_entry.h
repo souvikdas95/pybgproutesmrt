@@ -18,7 +18,14 @@
 
 /* ===== Binary (non-string) storage limits ===== */
 #define MAX_ASPATH_ASNS 256
-#define MAX_ASPATH_SEGS 16
+
+/* Stored AS_PATH is clamped to 255 ASNs: asPathLen and the segment offsets are
+ * uint8 (and so is the parquet aspath_segment_offsets list). The wire path is
+ * parsed in full first (RFC 6793 reconstruction needs the true lengths), then the
+ * leftmost 255 ASNs are kept and the segment that crosses the limit is cut there.
+ * Every non-empty segment holds at least one ASN, so 255 segments always suffice. */
+#define MAX_ASPATH_STORED 255
+#define MAX_ASPATH_SEGS 255
 
 /* Up to 4096 bytes of community payload:
  *  - classic communities (4B): 1024 values

@@ -16,7 +16,8 @@ BGPDUMP_MAX_FILE_LEN	= 1024
 BGPDUMP_MAX_AS_PATH_LEN	= 2000
 MAX_NB_PREFIXES         = 2048
 MAX_ASPATH_ASNS         = 256
-MAX_ASPATH_SEGS         = 64
+MAX_ASPATH_SEGS         = 255   # must equal MAX_ASPATH_SEGS in c_mrt_parser/mrt_entry.h
+MAX_RIB_PEERS           = 65536 # must equal MAX_RIB_PEERS in c_mrt_parser/file_buffer.h
 MAX_COMMUNITIES         = 1024
 MAX_ATTR                = 4096
 
@@ -71,7 +72,7 @@ class FILE_BUF_T(Structure):
         ("filename", c_char * BGPDUMP_MAX_FILE_LEN),  # Filename array of length BGPDUMP_MAX_FILE_LEN
         ("parsed", c_int),        # Indicates if the file is parsed
         ("parsed_ok", c_int),     # Indicates if the parsing was successful
-        ("index", RIB_PEER_INDEX_T * 256),
+        ("index", RIB_PEER_INDEX_T * MAX_RIB_PEERS),
         ("actPeerIdx", c_int),
         ("actEntry", ctypes.c_void_p)
     ]

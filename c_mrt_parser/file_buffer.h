@@ -26,6 +26,10 @@
 #define BGPDUMP_MAX_FILE_LEN	1024
 #define BGPDUMP_MAX_AS_PATH_LEN	2000
 
+/* RFC 6396 4.3.1: PEER_INDEX_TABLE has a 16-bit Peer Count and RIB entries a
+ * 16-bit Peer Index, so a table can hold up to 65,535 peers (indices 0..65534). */
+#define MAX_RIB_PEERS 65536
+
 typedef struct 
 {
     /**
@@ -96,10 +100,11 @@ typedef struct FileBuffer {
      * @brief Contains the list of peer index structures (only in case of parsing
      * a RIB dump).
      */
-    rib_peer_index_t index[256];
+    rib_peer_index_t index[MAX_RIB_PEERS];
 
     /**
-     * @brief Number of peers currently in the index table.
+     * @brief Number of peers in the last PEER_INDEX_TABLE read (0 before one is read).
+     * RIB entries must reference an index below this count.
      */
     int     actPeerIdx;
 

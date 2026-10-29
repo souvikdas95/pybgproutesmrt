@@ -90,7 +90,7 @@ uint8_t get_buf_char(u_char* buf)
 
 uint16_t get_buf_short(u_char* buf)
 {
-    uint16_t ch = 256 * buf[0] + buf[1];
+    uint16_t ch = (uint16_t)(((uint16_t)buf[0] << 8) | (uint16_t)buf[1]);
 
     return ch;
 }
@@ -98,7 +98,9 @@ uint16_t get_buf_short(u_char* buf)
 
 uint32_t get_buf_int(u_char* buf)
 {
-    uint32_t ch = 256 * 256 * 256 * buf[0] + 256 * 256 * buf[1] + 256 * buf[2] + buf[3];
+    /* Unsigned arithmetic: 256*256*256*buf[0] overflows int (undefined behaviour)
+     * for values >= 2^31, e.g. private-use 4-byte ASNs 4200000000-4294967294. */
+    uint32_t ch = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) | ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
     return ch;
 }
 
@@ -162,20 +164,34 @@ int process_prefix(u_char* buffer, uint64_t* address1, uint64_t* address0, uint8
 
 
 
+/* Parse-time capacity for one AS_PATH / AS4_PATH attribute. A 4096-byte UPDATE
+ * holds at most about 2,030 two-byte ASNs or 1,015 four-byte ASNs, and at most
+ * about 1,020 segments, so the wire path is always held in full here. Counts are
+ * 16-bit so they cannot wrap. The stored path is clamped later, at commit time
+ * (MAX_ASPATH_STORED). */
+#define ASPATH_PARSE_MAX_ASNS 2048
+#define ASPATH_PARSE_MAX_SEGS 1024
+
 typedef struct
 {
     uint8_t  present;
-    uint8_t  asn_count;
-    uint8_t  seg_count;
-    uint32_t asn[MAX_ASPATH_ASNS];
-    uint8_t  seg_type[MAX_ASPATH_SEGS];
-    uint8_t  seg_len[MAX_ASPATH_SEGS];
-    uint8_t  seg_off[MAX_ASPATH_SEGS];
+    uint16_t asn_count;
+    uint16_t seg_count;
+    uint32_t asn[ASPATH_PARSE_MAX_ASNS];
+    uint8_t  seg_type[ASPATH_PARSE_MAX_SEGS];
+    uint16_t seg_len[ASPATH_PARSE_MAX_SEGS];
+    uint16_t seg_off[ASPATH_PARSE_MAX_SEGS];
 } Parsed_aspath_t;
 
 static inline void parsed_aspath_reset(Parsed_aspath_t* p)
 {
-    memset(p, 0, sizeof(*p));
+    /* Clear the counts only. Every reader stops at asn_count / seg_count and the
+     * arrays are written before they are read, so clearing the whole 13 KB struct
+     * (done several times per entry) only costs CPU: about 20% of the generator's
+     * time on RIB chunks. */
+    p->present = 0;
+    p->asn_count = 0;
+    p->seg_count = 0;
 }
 
 static inline int is_confed_seg(uint8_t t)
@@ -188,10 +204,10 @@ static inline int is_confed_seg(uint8_t t)
 static int aspath_metric(const Parsed_aspath_t* p)
 {
     int m = 0;
-    for (uint8_t s = 0; s < p->seg_count; s++)
+    for (uint16_t s = 0; s < p->seg_count; s++)
     {
-        uint8_t t = p->seg_type[s];
-        uint8_t l = p->seg_len[s];
+        uint8_t  t = p->seg_type[s];
+        uint16_t l = p->seg_len[s];
 
         if (t == BGP_UPDATE_AS_PATH_SEQ)
         {
@@ -209,44 +225,43 @@ static int aspath_metric(const Parsed_aspath_t* p)
     return m;
 }
 
-static inline void aspath_append_segment(Parsed_aspath_t* dst, uint8_t segType, const uint32_t* asns, uint8_t segLen)
+static inline void aspath_append_segment(Parsed_aspath_t* dst, uint8_t segType, const uint32_t* asns, uint16_t segLen)
 {
     if (segLen == 0) return;
 
-    /* record segment metadata (best-effort) */
-    if (dst->seg_count < MAX_ASPATH_SEGS)
-    {
-        dst->seg_type[dst->seg_count] = segType;
-        dst->seg_len[dst->seg_count]  = segLen;
-        dst->seg_off[dst->seg_count]  = dst->asn_count;
-        dst->seg_count++;
-    }
+    /* A segment and its ASNs are recorded together, so metadata always matches
+     * the flattened ASN list. Capacity is never reached for a valid UPDATE. */
+    if (dst->seg_count >= ASPATH_PARSE_MAX_SEGS || dst->asn_count >= ASPATH_PARSE_MAX_ASNS) return;
 
-    /* append ASNs (best-effort) */
-    for (uint8_t i = 0; i < segLen; i++)
+    uint16_t room = (uint16_t)(ASPATH_PARSE_MAX_ASNS - dst->asn_count);
+    uint16_t take = (segLen <= room) ? segLen : room;
+
+    dst->seg_type[dst->seg_count] = segType;
+    dst->seg_len[dst->seg_count]  = take;
+    dst->seg_off[dst->seg_count]  = dst->asn_count;
+    dst->seg_count++;
+
+    for (uint16_t i = 0; i < take; i++)
     {
-        if (dst->asn_count < MAX_ASPATH_ASNS)
-        {
-            dst->asn[dst->asn_count++] = asns[i];
-        }
+        dst->asn[dst->asn_count++] = asns[i];
     }
 }
 
 static inline void aspath_append_path(Parsed_aspath_t* dst, const Parsed_aspath_t* src)
 {
-    for (uint8_t s = 0; s < src->seg_count; s++)
+    for (uint16_t s = 0; s < src->seg_count; s++)
     {
-        uint8_t t = src->seg_type[s];
-        uint8_t l = src->seg_len[s];
-        uint8_t o = src->seg_off[s];
-        if (o + l <= src->asn_count)
+        uint8_t  t = src->seg_type[s];
+        uint16_t l = src->seg_len[s];
+        uint16_t o = src->seg_off[s];
+        if ((uint32_t)o + l <= src->asn_count)
         {
             aspath_append_segment(dst, t, &src->asn[o], l);
         }
         else if (o < src->asn_count)
         {
             /* defensive clamp on malformed metadata */
-            uint8_t clamp = (uint8_t)(src->asn_count - o);
+            uint16_t clamp = (uint16_t)(src->asn_count - o);
             aspath_append_segment(dst, t, &src->asn[o], clamp);
         }
     }
@@ -329,15 +344,19 @@ static int parse_aspath_attr_payload(const u_char* buffer,
             return -1;
         }
 
-        if (out->seg_count < MAX_ASPATH_SEGS)
+        /* Segment metadata and ASNs are recorded together (never one without the
+         * other); seg_len counts the ASNs actually kept. */
+        int16_t seg_slot = -1;
+        if (out->seg_count < ASPATH_PARSE_MAX_SEGS && out->asn_count < ASPATH_PARSE_MAX_ASNS)
         {
+            seg_slot = (int16_t)out->seg_count;
             out->seg_type[out->seg_count] = segType;
-            out->seg_len[out->seg_count]  = segLen;
+            out->seg_len[out->seg_count]  = 0;
             out->seg_off[out->seg_count]  = out->asn_count;
             out->seg_count++;
         }
 
-        for (uint8_t i = 0; i < segLen; i++)
+        for (uint16_t i = 0; i < segLen; i++)
         {
             uint32_t asn_val = 0;
 
@@ -356,9 +375,10 @@ static int parse_aspath_attr_payload(const u_char* buffer,
                 parsed += 4;
             }
 
-            if (out->asn_count < MAX_ASPATH_ASNS)
+            if (seg_slot >= 0 && out->asn_count < ASPATH_PARSE_MAX_ASNS)
             {
                 out->asn[out->asn_count++] = asn_val;
+                out->seg_len[seg_slot]++;
             }
         }
     }
@@ -404,14 +424,14 @@ static void reconstruct_aspath(Parsed_aspath_t* out,
     int need = m2 - m4;
 
     /* Always keep leading confed segments from AS_PATH (excluded from AS4_PATH). */
-    uint8_t s = 0;
+    uint16_t s = 0;
     while (s < as_path->seg_count && is_confed_seg(as_path->seg_type[s]))
     {
-        uint8_t o = as_path->seg_off[s];
-        uint8_t l = as_path->seg_len[s];
+        uint16_t o = as_path->seg_off[s];
+        uint16_t l = as_path->seg_len[s];
         if (o < as_path->asn_count)
         {
-            uint8_t clamp = (uint8_t)((o + l <= as_path->asn_count) ? l : (as_path->asn_count - o));
+            uint16_t clamp = (uint16_t)(((uint32_t)o + l <= as_path->asn_count) ? l : (as_path->asn_count - o));
             aspath_append_segment(&prefix, as_path->seg_type[s], &as_path->asn[o], clamp);
         }
         s++;
@@ -423,13 +443,13 @@ static void reconstruct_aspath(Parsed_aspath_t* out,
     /* Take as many leading segments / ASNs as necessary from AS_PATH to reach "need". */
     while (remaining > 0 && s < as_path->seg_count)
     {
-        uint8_t t = as_path->seg_type[s];
-        uint8_t o = as_path->seg_off[s];
-        uint8_t l = as_path->seg_len[s];
+        uint8_t  t = as_path->seg_type[s];
+        uint16_t o = as_path->seg_off[s];
+        uint16_t l = as_path->seg_len[s];
 
         if (o >= as_path->asn_count) break;
 
-        uint8_t clamp = (uint8_t)((o + l <= as_path->asn_count) ? l : (as_path->asn_count - o));
+        uint16_t clamp = (uint16_t)(((uint32_t)o + l <= as_path->asn_count) ? l : (as_path->asn_count - o));
         const uint32_t* asns = &as_path->asn[o];
 
         if (is_confed_seg(t))
@@ -450,7 +470,7 @@ static void reconstruct_aspath(Parsed_aspath_t* out,
         }
 
         /* Treat everything else as AS_SEQUENCE-like for reconstruction */
-        uint8_t take = (clamp <= (uint8_t)remaining) ? clamp : (uint8_t)remaining;
+        uint16_t take = ((int)clamp <= remaining) ? clamp : (uint16_t)remaining;
         aspath_append_segment(&prefix, t, asns, take);
         remaining -= (int)take;
 
@@ -468,11 +488,11 @@ static void reconstruct_aspath(Parsed_aspath_t* out,
     {
         while (s < as_path->seg_count && is_confed_seg(as_path->seg_type[s]))
         {
-            uint8_t o = as_path->seg_off[s];
-            uint8_t l = as_path->seg_len[s];
+            uint16_t o = as_path->seg_off[s];
+            uint16_t l = as_path->seg_len[s];
             if (o < as_path->asn_count)
             {
-                uint8_t clamp = (uint8_t)((o + l <= as_path->asn_count) ? l : (as_path->asn_count - o));
+                uint16_t clamp = (uint16_t)(((uint32_t)o + l <= as_path->asn_count) ? l : (as_path->asn_count - o));
                 aspath_append_segment(&prefix, as_path->seg_type[s], &as_path->asn[o], clamp);
             }
             s++;
@@ -483,24 +503,36 @@ static void reconstruct_aspath(Parsed_aspath_t* out,
     aspath_append_path(out, as4_path);
 }
 
+/* Store the (reconstructed) path in the entry, clamped to MAX_ASPATH_STORED ASNs.
+ * The leftmost ASNs are kept (peer side first, as on the wire); a segment that
+ * crosses the limit is cut there and later segments are dropped, so segment
+ * metadata always describes exactly the stored ASNs. */
 static void commit_aspath_to_entry(MRTentry* entry, const Parsed_aspath_t* p)
 {
-    entry->asPathLen      = p->asn_count;
-    entry->asPathSegCount = p->seg_count;
+    const uint16_t n = (p->asn_count > MAX_ASPATH_STORED) ? (uint16_t)MAX_ASPATH_STORED : p->asn_count;
+    entry->asPathLen = (uint8_t)n;
 
     /* Copy flattened ASNs */
-    for (uint8_t i = 0; i < p->asn_count; i++)
+    for (uint16_t i = 0; i < n; i++)
     {
         entry->asPath[i] = p->asn[i];
     }
 
-    /* Copy segment metadata */
-    for (uint8_t s = 0; s < p->seg_count; s++)
+    /* Copy segment metadata, clamped to the stored ASNs */
+    uint16_t sc = 0;
+    for (uint16_t s = 0; s < p->seg_count && sc < MAX_ASPATH_SEGS; s++)
     {
-        entry->asPathSegType[s]   = p->seg_type[s];
-        entry->asPathSegLen[s]    = p->seg_len[s];
-        entry->asPathSegOffset[s] = p->seg_off[s];
+        const uint16_t off = p->seg_off[s];
+        if (off >= n) break;
+        uint16_t len = p->seg_len[s];
+        if ((uint32_t)off + len > n) len = (uint16_t)(n - off);
+        if (len == 0) continue;
+        entry->asPathSegType[sc]   = p->seg_type[s];
+        entry->asPathSegLen[sc]    = (uint8_t)len;
+        entry->asPathSegOffset[sc] = (uint8_t)off;
+        sc++;
     }
+    entry->asPathSegCount = (uint8_t)sc;
 }
 
 
@@ -970,18 +1002,25 @@ int process_bgp_rib_index(u_char *buffer, MRTentry* entry, int max_len)
     peerCount = get_buf_short(buffer+actOff);
     UPDATE_AND_CHECK_LEN(actOff, 2, max_len, 0)
 
+    /* A RIB entry's Peer Index is the peer's position in the PEER_INDEX_TABLE
+     * (RFC 6396 4.3.1), so peer i of this table goes to index[i]. In the pipeline
+     * every chunk starts with its own copy of the file's table (chunker.cpp) and
+     * is parsed with a fresh File_buf_t, so this is the only table in the stream
+     * and the reset below changes nothing there. It only matters for a stream
+     * that holds a second table, which then replaces the first. */
+    entry->dumper->actPeerIdx = 0;
+
     for (int i = 0 ; i < peerCount ; i++)
     {
         /* Get peer Type */
         peerType = get_buf_char(buffer+actOff);
         UPDATE_AND_CHECK_LEN(actOff, 1, max_len, 0)
-        
+
         /* Skip peer ID */
         UPDATE_AND_CHECK_LEN(actOff, 4, max_len, 0)
-        peerIdx = entry->dumper->actPeerIdx;
-        entry->dumper->actPeerIdx++;
+        peerIdx = (uint32_t)i;
 
-        if (peerIdx < 256)
+        if (peerIdx < MAX_RIB_PEERS)
         {
             entry->dumper->index[peerIdx].afi = peerType;
             entry->dumper->index[peerIdx].idx = peerIdx;
@@ -1038,6 +1077,9 @@ int process_bgp_rib_index(u_char *buffer, MRTentry* entry, int max_len)
                 UPDATE_AND_CHECK_LEN(actOff, 2, max_len, 0)
             }
         }
+
+        /* Peer i is fully read: entries may now reference indices 0..i */
+        entry->dumper->actPeerIdx = i + 1;
     }
 
     return 1;
@@ -1081,8 +1123,8 @@ int process_bgp_rib_entry(u_char *buffer, MRTentry* entry, int max_len)
     UPDATE_AND_CHECK_LEN(actOff, 2, max_len, 0)
 
 
-    /* If peer Index is too long, skip */
-    if (peerIdx >= 256)
+    /* The index must name a peer of the PEER_INDEX_TABLE read before this record */
+    if ((int)peerIdx >= entry->dumper->actPeerIdx)
     {
         return 0;
     }
@@ -1122,8 +1164,8 @@ int process_bgp_rib_entry(u_char *buffer, MRTentry* entry, int max_len)
         UPDATE_AND_CHECK_LEN(actOff, 2, max_len, 0)
 
 
-        /* If peer Index is too long, skip */
-        if (peerIdx >= 256)
+        /* The index must name a peer of the PEER_INDEX_TABLE read before this record */
+        if ((int)peerIdx >= entry->dumper->actPeerIdx)
         {
             return 0;
         }

@@ -23,6 +23,12 @@ OTHER    = *.in configure README*
 
 all: bgproutesmrt libbgproutesmrt.so
 
+# Objects also depend on the local headers. Without this line make rebuilds an
+# object only when its own .c changes, so a header change (MAX_ASPATH_SEGS in
+# mrt_entry.h, say) can leave one library built with two layouts of MRTentry.
+# Keep this rule below "all" so that "all" stays the default target.
+$(LIB_O): $(LIB_H) cfr_files.h mrt_entry.h file_buffer.h bgproutesmrt-config.h
+
 libbgproutesmrt.a: $(LIB_H) $(LIB_O) Makefile cfr_files.h
 	ar r libbgproutesmrt.a $(LIB_O)
 	$(RANLIB) libbgproutesmrt.a
